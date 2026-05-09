@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Post Pigeon · carrier service for your APIs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+
+<!-- ============================ TOP BAR ============================ -->
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark" aria-hidden="true" title="Post Pigeon">
+      <svg class="brand-bird" viewBox="0 0 28 24" width="26" height="22">
+        <!-- body + wing + head, single fill -->
+        <path d="M2 15 C5 13 8 13 11 14 L14 9 L17 11 L22 7 L21 13 L25 12 L23 16 L18 19 L12 19 L9 22 L8 19 L5 18 Z"
+              fill="currentColor"/>
+        <!-- eye -->
+        <circle cx="20.2" cy="9.4" r=".7" fill="#0b0c0e"/>
+        <!-- beak -->
+        <path d="M22 7 L25.5 6.2 L23 8.2 Z" fill="#d9a441"/>
+      </svg>
+      <span class="brand-mark-dot"></span>
+    </div>
+    <div class="brand-text">
+      <strong>POST PIGEON</strong>
+      <span class="brand-sub">self-hosted carrier</span>
+    </div>
+  </div>
+
+  <nav class="topbar-actions">
+    <div class="env-switcher" id="envSwitcher">
+      <span class="env-label" title="Active environment — variables in this set will be substituted into {{placeholders}} when you send.">env</span>
+      <button class="env-button" id="envButton" aria-label="Cycle active environment" title="Click to cycle through environments. Manage their variables in the sidebar › envs.">
+        <span class="env-dot"></span>
+        <span id="envCurrentName">No environment</span>
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+      </button>
+    </div>
+    <button class="ghost-btn" data-action="open-vars" title="Inspect resolved variables for the active environment">vars</button>
+    <button class="ghost-btn" data-action="import" title="Import a request from a cURL command or paste exported JSON">import</button>
+    <button class="ghost-btn" data-action="export" title="Export collections + environments as JSON for backup or sharing">export</button>
+    <span class="topbar-sep"></span>
+    <span class="topbar-status" id="serverStatus" title="Server proxy status. When ok, requests are sent through proxy.php (no CORS). When offline, the browser falls back to direct fetch().">
+      <span class="topbar-status-dot"></span>
+      <span id="serverStatusText">checking proxy…</span>
+    </span>
+  </nav>
+</header>
+
+<!-- ============================ MAIN GRID ============================ -->
+<main class="grid">
+
+  <!-- =========== SIDEBAR =========== -->
+  <aside class="sidebar">
+    <nav class="side-tabs" role="tablist">
+      <button class="side-tab is-active" data-pane="collections" title="Saved requests, organized into folders">collections</button>
+      <button class="side-tab" data-pane="history" title="Every request you've sent — click to reopen">history</button>
+      <button class="side-tab" data-pane="envs" title="Sets of variables (e.g. baseUrl, token) for different environments">envs</button>
+    </nav>
+
+    <div class="side-search" title="Filter the active sidebar pane">
+      <svg width="12" height="12" viewBox="0 0 12 12"><circle cx="5" cy="5" r="3.5" stroke="currentColor" fill="none" stroke-width="1.2"/><path d="M8 8l3 3" stroke="currentColor" stroke-width="1.2"/></svg>
+      <input id="sideSearch" placeholder="filter…" aria-label="Filter sidebar">
+      <kbd title="Press / anywhere to focus this search">/</kbd>
+    </div>
+
+    <!-- Collections pane -->
+    <section class="side-pane is-active" data-pane="collections">
+      <div class="side-pane-header">
+        <span class="side-pane-title">Collections</span>
+        <button class="icon-btn" data-action="new-collection" title="Create a new collection" aria-label="New collection">＋</button>
+      </div>
+      <div class="tree" id="collectionsTree"></div>
+    </section>
+
+    <!-- History pane -->
+    <section class="side-pane" data-pane="history">
+      <div class="side-pane-header">
+        <span class="side-pane-title">History</span>
+        <button class="icon-btn" data-action="clear-history" title="Clear all request history" aria-label="Clear history">✕</button>
+      </div>
+      <div class="tree" id="historyTree"></div>
+    </section>
+
+    <!-- Environments pane -->
+    <section class="side-pane" data-pane="envs">
+      <div class="side-pane-header">
+        <span class="side-pane-title">Environments</span>
+        <button class="icon-btn" data-action="new-env" title="Create a new environment" aria-label="New environment">＋</button>
+      </div>
+      <div class="tree" id="envTree"></div>
+    </section>
+
+    <div class="sidebar-footer">
+      <button class="ghost-btn" data-action="docs" title="Open the README / documentation">docs</button>
+      <button class="ghost-btn" data-action="shortcuts" title="Keyboard shortcuts cheatsheet">shortcuts</button>
+    </div>
+  </aside>
+
+  <!-- =========== WORKSPACE =========== -->
+  <section class="workspace">
+
+    <!-- Tab bar -->
+    <div class="tabbar" id="tabbar"></div>
+
+    <!-- Per-tab panels are mounted into here -->
+    <div class="workspace-body" id="workspaceBody"></div>
+
+  </section>
+</main>
+
+<!-- ============================ MODAL ROOT ============================ -->
+<div class="modal-root" id="modalRoot" hidden></div>
+
+<!-- ============================ TEMPLATES ============================ -->
+
+<template id="tpl-tab-panel">
+  <div class="tab-panel" data-tab-panel>
+    <!-- ===== Request bar ===== -->
+    <div class="reqbar">
+      <div class="reqbar-method-wrap">
+        <select class="method-select" data-bind="method" title="HTTP method" aria-label="HTTP method">
+          <option>GET</option><option>POST</option><option>PUT</option>
+          <option>PATCH</option><option>DELETE</option><option>HEAD</option>
+          <option>OPTIONS</option>
+        </select>
+      </div>
+      <div class="reqbar-url-wrap">
+        <input class="url-input" data-bind="url" spellcheck="false"
+               placeholder="https://api.example.com/v1/{{resource}}"
+               title="Request URL. Use {{var}} to insert variables from the active environment."
+               aria-label="Request URL">
+        <div class="url-overlay" data-overlay aria-hidden="true"></div>
+      </div>
+      <button class="send-btn" data-action="send" title="Send request (⌘↵ / Ctrl+↵)">
+        <span class="send-btn-label">Send</span>
+        <kbd>⌘↵</kbd>
+      </button>
+      <button class="ghost-btn ghost-btn--solid" data-action="save-request" title="Save this request to a collection (⌘S)">save</button>
+      <button class="ghost-btn" data-action="code-gen" title="Generate a code snippet for this request (cURL, fetch, axios, Python, PHP, Go)" aria-label="Generate code snippet">{ }</button>
+    </div>
+
+    <!-- ===== Request editor ===== -->
+    <div class="splitpane">
+      <div class="splitpane-top">
+        <div class="subtabs" data-subtabs="req" role="tablist">
+          <button class="subtab is-active" data-subtab="params" title="Query string parameters appended to the URL">Params <span class="badge" data-count="params"></span></button>
+          <button class="subtab" data-subtab="auth" title="Authorization — Basic, Bearer, or API Key">Auth</button>
+          <button class="subtab" data-subtab="headers" title="Request headers">Headers <span class="badge" data-count="headers"></span></button>
+          <button class="subtab" data-subtab="body" title="Request body (JSON, form data, urlencoded, raw, binary)">Body <span class="badge" data-count="body"></span></button>
+          <button class="subtab" data-subtab="prescript" title="JavaScript that runs before the request fires — set headers, mint timestamps, etc.">Pre-request</button>
+          <button class="subtab" data-subtab="tests" title="JavaScript assertions that run against the response">Tests</button>
+          <button class="subtab" data-subtab="settings" title="Per-request settings: timeout, redirects, SSL verification">Settings</button>
+        </div>
+
+        <div class="subtab-body" data-subtab-body>
+
+          <!-- Params -->
+          <div class="kv-editor" data-pane="params">
+            <div class="kv-editor-head" title="Query parameters appended after the ? in the URL. Toggle the checkbox to disable a row without deleting it.">
+              <span></span><span>Key</span><span>Value</span><span>Description</span><span></span>
+            </div>
+            <div class="kv-rows" data-rows="params"></div>
+            <button class="ghost-btn ghost-btn--row" data-action="add-row" data-row-target="params" title="Add a parameter row">+ row</button>
+          </div>
+
+          <!-- Auth -->
+          <div class="auth-pane" data-pane="auth" hidden>
+            <label class="field" title="Pick an authorization scheme. The right credentials become an Authorization header (or query param for API Key) when the request is sent.">
+              <span class="field-label">Type</span>
+              <select data-bind="auth.type">
+                <option value="none">No Auth</option>
+                <option value="basic">Basic Auth</option>
+                <option value="bearer">Bearer Token</option>
+                <option value="apikey">API Key</option>
+              </select>
+            </label>
+            <div class="auth-form" data-auth-form></div>
+          </div>
+
+          <!-- Headers -->
+          <div class="kv-editor" data-pane="headers" hidden>
+            <div class="kv-editor-head" title="Custom request headers. Content-Type is auto-set when you pick a body type, unless you override it here.">
+              <span></span><span>Header</span><span>Value</span><span>Description</span><span></span>
+            </div>
+            <div class="kv-rows" data-rows="headers"></div>
+            <button class="ghost-btn ghost-btn--row" data-action="add-row" data-row-target="headers" title="Add a header row">+ row</button>
+          </div>
+
+          <!-- Body -->
+          <div class="body-pane" data-pane="body" hidden>
+            <div class="body-modes" role="radiogroup" aria-label="Body type">
+              <label title="Send no body (default for GET / HEAD)"><input type="radio" name="bodymode" value="none" checked> none</label>
+              <label title="multipart/form-data — for file uploads and HTML form posts"><input type="radio" name="bodymode" value="form"> form-data</label>
+              <label title="application/x-www-form-urlencoded — classic form post"><input type="radio" name="bodymode" value="urlencoded"> x-www-form-urlencoded</label>
+              <label title="Raw payload — JSON, XML, plain text, etc."><input type="radio" name="bodymode" value="raw"> raw</label>
+              <label title="Binary file — streamed as the request body"><input type="radio" name="bodymode" value="binary"> binary</label>
+              <span class="body-mode-spacer"></span>
+              <select data-bind="body.rawType" class="body-rawtype" hidden title="Content-Type for the raw body">
+                <option value="json">JSON</option>
+                <option value="xml">XML</option>
+                <option value="html">HTML</option>
+                <option value="text">Text</option>
+                <option value="javascript">JavaScript</option>
+              </select>
+              <button class="ghost-btn" data-action="format-body" hidden data-bodyformat title="Pretty-print the JSON body">format</button>
+            </div>
+            <div class="body-editors">
+              <div class="kv-editor" data-bodyview="form" hidden>
+                <div class="kv-editor-head"><span></span><span>Key</span><span>Value</span><span>Type</span><span></span></div>
+                <div class="kv-rows" data-rows="form"></div>
+                <button class="ghost-btn ghost-btn--row" data-action="add-row" data-row-target="form">+ row</button>
+              </div>
+              <div class="kv-editor" data-bodyview="urlencoded" hidden>
+                <div class="kv-editor-head"><span></span><span>Key</span><span>Value</span><span>Description</span><span></span></div>
+                <div class="kv-rows" data-rows="urlencoded"></div>
+                <button class="ghost-btn ghost-btn--row" data-action="add-row" data-row-target="urlencoded">+ row</button>
+              </div>
+              <div class="raw-editor" data-bodyview="raw" hidden>
+                <textarea class="code-area" data-bind="body.raw" spellcheck="false" placeholder='{ "hello": "world" }'></textarea>
+              </div>
+              <div class="binary-drop" data-bodyview="binary" hidden>
+                <input type="file" data-bind="body.binary">
+                <p class="muted">Drop a file here or click to choose. The proxy will stream it as the request body.</p>
+              </div>
+              <div class="body-empty" data-bodyview="none">
+                <span class="muted">This request has no body.</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Pre-request -->
+          <div class="script-pane" data-pane="prescript" hidden>
+            <div class="script-help">
+              <strong>Pre-request script</strong><span class="muted">runs before send · access <code>rb.env.set('key','val')</code>, <code>rb.req.url</code>, <code>rb.req.headers</code></span>
+            </div>
+            <textarea class="code-area" data-bind="prescript" spellcheck="false" placeholder="// e.g.
+// rb.env.set('ts', Date.now());
+// rb.req.headers.push({name:'X-Trace', value:rb.env.get('ts')});"></textarea>
+          </div>
+
+          <!-- Tests -->
+          <div class="script-pane" data-pane="tests" hidden>
+            <div class="script-help">
+              <strong>Tests</strong><span class="muted">run after response · use <code>rb.test('name', () => …)</code> · <code>rb.expect(value).toEqual(x)</code></span>
+            </div>
+            <textarea class="code-area" data-bind="tests" spellcheck="false" placeholder="rb.test('status is 200', () => rb.expect(rb.res.status).toEqual(200));
+rb.test('has id', () => rb.expect(rb.res.json.id).toBeTruthy());"></textarea>
+          </div>
+
+          <!-- Per-request settings -->
+          <div class="settings-pane" data-pane="settings" hidden>
+            <label class="field field--row" title="When on, the proxy follows 301/302/307/308 chains automatically.">
+              <input type="checkbox" data-bind="settings.followRedirects"> follow redirects
+            </label>
+            <label class="field field--row" title="Disable to allow self-signed / invalid TLS certificates (use with care).">
+              <input type="checkbox" data-bind="settings.verifySSL" checked> verify SSL certificate
+            </label>
+            <label class="field" title="How long to wait for a response before giving up (1–600 seconds).">
+              <span class="field-label">Timeout (s)</span>
+              <input type="number" min="1" max="600" data-bind="settings.timeout" value="30">
+            </label>
+            <label class="field" title="Free-form notes about this request — only saved in the collection, not sent.">
+              <span class="field-label">Description</span>
+              <textarea data-bind="description" rows="3" placeholder="What does this request do?"></textarea>
+            </label>
+          </div>
+
+        </div>
+      </div>
+
+      <div class="splitpane-divider" data-action="resize-split"></div>
+
+      <!-- ===== Response viewer ===== -->
+      <div class="splitpane-bot">
+        <div class="response-meta" data-resp-meta>
+          <span class="resp-empty muted">No response yet — hit <kbd>Send</kbd> to fire this request.</span>
+        </div>
+        <div class="subtabs" data-subtabs="resp" hidden role="tablist">
+          <button class="subtab is-active" data-subtab="body" title="Response body">Body</button>
+          <button class="subtab" data-subtab="headers" title="Response headers from the server">Headers <span class="badge" data-count="resp-headers"></span></button>
+          <button class="subtab" data-subtab="cookies" title="Set-Cookie headers parsed into a table">Cookies</button>
+          <button class="subtab" data-subtab="tests" title="Pass/fail of your test assertions">Tests <span class="badge" data-count="resp-tests"></span></button>
+          <button class="subtab" data-subtab="timeline" title="Phase breakdown (synthetic)">Timeline</button>
+          <span class="subtab-spacer"></span>
+          <div class="resp-viewmode" hidden data-bodyviewmode title="Switch how the body is rendered">
+            <button class="seg is-active" data-viewmode="pretty" title="Pretty-printed with syntax highlighting (JSON / XML)">pretty</button>
+            <button class="seg" data-viewmode="raw" title="Raw text exactly as returned">raw</button>
+            <button class="seg" data-viewmode="preview" title="Render in iframe (HTML responses only)">preview</button>
+          </div>
+          <div class="resp-search" hidden>
+            <input data-action="search-resp" placeholder="search response…" title="Highlight matches in the response body" aria-label="Search response">
+          </div>
+        </div>
+        <div class="subtab-body" data-resp-body hidden></div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<!-- KV row template -->
+<template id="tpl-kv-row">
+  <div class="kv-row">
+    <input type="checkbox" class="kv-check" checked title="Toggle this row on/off without deleting it" aria-label="Enable row">
+    <input class="kv-key" placeholder="key" spellcheck="false" aria-label="Key">
+    <input class="kv-val" placeholder="value" spellcheck="false" aria-label="Value">
+    <input class="kv-desc" placeholder="description" spellcheck="false" aria-label="Description">
+    <button class="kv-del" title="Remove this row" aria-label="Remove row">✕</button>
+  </div>
+</template>
+
+<script src="assets/app.js" defer></script>
+</body>
+</html>
