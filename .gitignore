@@ -1,6 +1,10 @@
 # Local persistence — never commit user data.
 /data/
 
+# Real deployment config has DB credentials. Never commit it; ship config.example.php.
+/config.php
+/.env
+
 # Editor / OS junk
 .DS_Store
 Thumbs.db

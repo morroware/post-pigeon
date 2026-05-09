@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="assets/styles.css">
+<link rel="stylesheet" href="assets/auth.css">
 </head>
 <body>
 
@@ -49,6 +50,24 @@
       <span class="topbar-status-dot"></span>
       <span id="serverStatusText">checking proxy…</span>
     </span>
+
+    <span class="topbar-sep"></span>
+    <div class="account-wrap" id="accountWrap">
+      <button class="account-pill" id="accountPill" type="button" aria-haspopup="menu" aria-expanded="false" title="Account">
+        <span class="account-avatar" id="accountAvatar">·</span>
+        <span class="account-name" id="accountName">…</span>
+        <svg class="account-caret" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.2" fill="none"/></svg>
+      </button>
+      <div class="account-menu" id="accountMenu" role="menu" hidden>
+        <div class="account-menu-label">Signed in as</div>
+        <div class="account-menu-meta" id="accountMenuEmail">—</div>
+        <hr>
+        <button type="button" data-action="change-password">Change password…</button>
+        <button type="button" data-action="open-admin" id="adminMenuBtn" hidden>Admin · users…</button>
+        <hr>
+        <button type="button" data-action="logout">Sign out</button>
+      </div>
+    </div>
   </nav>
 </header>
 

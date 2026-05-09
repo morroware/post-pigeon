@@ -1,0 +1,8 @@
+# Post Pigeon — lib/ holds PHP modules that are required from the public
+# entry points (auth.php, api.php, admin.php, etc.). They must NEVER be
+# requested directly over HTTP, so deny everything.
+Require all denied
+<IfModule !mod_authz_core.c>
+  Order allow,deny
+  Deny from all
+</IfModule>

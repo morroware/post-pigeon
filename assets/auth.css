@@ -1,0 +1,338 @@
+/* =============================================================
+   Post Pigeon — auth pages (login, setup) + account modal styles.
+   Reuses palette + typography variables defined in styles.css.
+   ============================================================= */
+
+.auth-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 32px 16px;
+  background: var(--bg);
+  overflow: auto;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  padding: 28px 28px 20px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+}
+
+.auth-head {
+  margin-bottom: 24px;
+}
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--accent);
+}
+.auth-brand strong {
+  font: 700 13px/1 var(--ui);
+  letter-spacing: 0.16em;
+  color: var(--text);
+}
+.auth-sub {
+  font: 500 11px/1 var(--mono);
+  color: var(--text-mute);
+  margin-left: auto;
+  letter-spacing: 0.04em;
+}
+
+.auth-title {
+  font: 600 22px/1.2 var(--ui);
+  margin: 0 0 4px;
+  color: var(--text);
+}
+.auth-lead {
+  font: 500 12px/1.4 var(--mono);
+  margin: 0 0 20px;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.auth-form .field-label {
+  font: 600 10px/1 var(--mono);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.auth-form input[type="text"],
+.auth-form input[type="email"],
+.auth-form input[type="password"] {
+  background: var(--bg-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: 400 14px/1.4 var(--ui);
+  padding: 10px 12px;
+  transition: border-color 80ms ease;
+}
+.auth-form input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.auth-submit {
+  margin-top: 6px;
+  width: 100%;
+  background: var(--accent);
+  color: #1a1306;
+  font: 600 13px/1 var(--ui);
+  letter-spacing: 0.04em;
+  padding: 12px;
+  border-radius: var(--radius);
+  border: 0;
+  cursor: pointer;
+  transition: background 80ms ease;
+}
+.auth-submit:hover { background: var(--accent-2); }
+.auth-submit:disabled {
+  opacity: 0.5; cursor: progress;
+}
+.auth-submit--link {
+  display: inline-block;
+  width: auto;
+  padding: 10px 18px;
+  text-decoration: none;
+  text-align: center;
+}
+
+.auth-flash {
+  font: 500 12px/1.4 var(--mono);
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  margin: 0 0 4px;
+}
+.auth-flash--err {
+  background: rgba(217, 99, 99, 0.10);
+  border: 1px solid rgba(217, 99, 99, 0.40);
+  color: #f5b7b7;
+}
+.auth-flash--ok {
+  background: rgba(79, 178, 134, 0.10);
+  border: 1px solid rgba(79, 178, 134, 0.40);
+  color: #b9e6cd;
+}
+
+.auth-foot {
+  margin-top: 24px;
+  font: 500 11px/1.5 var(--mono);
+}
+.auth-foot a {
+  color: var(--accent-2);
+  text-decoration: none;
+}
+.auth-foot a:hover { text-decoration: underline; }
+
+.auth-list {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  font: 500 13px/1.6 var(--ui);
+  color: var(--text-dim);
+}
+.auth-list code {
+  font: 500 12px/1 var(--mono);
+  color: var(--accent-2);
+}
+
+/* ============================================================
+   Topbar account pill + dropdown (lives in app.html top bar)
+   ============================================================ */
+.account-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.account-wrap[hidden] { display: none !important; }
+
+.account-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 6px;
+  background: var(--bg-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: 500 12px/1 var(--mono);
+  cursor: pointer;
+}
+.account-pill:hover { background: var(--bg-4); }
+.account-pill .account-avatar {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #1a1306;
+  font: 700 10px/18px var(--ui);
+  text-align: center;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.account-pill[data-admin="true"] .account-avatar {
+  background: linear-gradient(135deg, var(--accent), #b07cd9 110%);
+}
+.account-name { max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-caret {
+  width: 10px; height: 10px;
+  flex: 0 0 auto;
+  color: var(--text-mute);
+}
+
+.account-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  min-width: 200px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  padding: 4px;
+  z-index: 50;
+}
+.account-menu[hidden] { display: none; }
+.account-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font: 500 12px/1 var(--mono);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+.account-menu button:hover { background: var(--bg-3); }
+.account-menu hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 4px 0;
+}
+.account-menu .account-menu-label {
+  padding: 6px 10px 4px;
+  font: 600 10px/1 var(--mono);
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.account-menu .account-menu-meta {
+  padding: 0 10px 6px;
+  font: 500 11px/1.4 var(--mono);
+  color: var(--text-dim);
+  word-break: break-all;
+}
+
+/* ============================================================
+   Admin panel modal
+   ============================================================ */
+.admin-modal { width: min(720px, 92vw); }
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font: 500 12px/1.4 var(--mono);
+}
+.admin-table th, .admin-table td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  vertical-align: middle;
+}
+.admin-table th {
+  font: 600 10px/1 var(--mono);
+  color: var(--text-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  background: var(--bg-1);
+}
+.admin-table tr:hover td { background: var(--bg-3); }
+
+.admin-pill {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 2px;
+  font: 600 10px/1 var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.admin-pill[data-on="true"]  { background: var(--accent-bg); color: var(--accent-2); }
+.admin-pill[data-on="false"] { background: var(--bg-3); color: var(--text-mute); }
+
+.admin-actions { display: flex; gap: 4px; flex-wrap: wrap; }
+.admin-actions .ghost-btn { padding: 3px 6px; font-size: 10px; }
+.admin-actions .ghost-btn[data-danger="true"] { color: var(--err); }
+
+.admin-create-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 14px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+}
+.admin-create-form .field { display: flex; flex-direction: column; gap: 4px; }
+.admin-create-form .field-wide { grid-column: 1 / -1; }
+.admin-create-form input[type="checkbox"] { margin-right: 6px; }
+.admin-create-form .field-row {
+  display: flex;
+  align-items: center;
+  font: 500 11px/1 var(--mono);
+  color: var(--text-dim);
+}
+.admin-create-form button {
+  grid-column: 1 / -1;
+  padding: 10px;
+  background: var(--accent);
+  color: #1a1306;
+  font: 600 12px/1 var(--ui);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.admin-create-form button:hover { background: var(--accent-2); }
+
+.temp-password-banner {
+  background: rgba(217, 164, 65, 0.10);
+  border: 1px solid rgba(217, 164, 65, 0.40);
+  color: var(--accent-2);
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  margin-bottom: 14px;
+  font: 500 12px/1.4 var(--mono);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.temp-password-banner code {
+  font: 600 13px/1 var(--mono);
+  color: var(--accent-2);
+  background: rgba(0,0,0,0.3);
+  padding: 4px 8px;
+  border-radius: 2px;
+}
+.temp-password-banner button {
+  margin-left: auto;
+  padding: 4px 10px;
+  background: var(--accent);
+  color: #1a1306;
+  border-radius: 2px;
+  font: 600 11px/1 var(--ui);
+}
