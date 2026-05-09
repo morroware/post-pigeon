@@ -1,0 +1,10 @@
+# Local persistence — never commit user data.
+/data/
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
