@@ -2,9 +2,17 @@
 // proxy.php — Post Pigeon's server-side cURL proxy so the browser can hit any API
 // without CORS interference. Returns a JSON envelope with the response
 // body, status, headers, and timing.
+//
+// Authentication: the caller must hold a valid session cookie. This is what
+// stops a public deployment from being abused as an open SSRF gateway.
 
-header('Content-Type: application/json; charset=utf-8');
-header('X-Content-Type-Options: nosniff');
+require_once __DIR__ . '/lib/util.php';
+require_once __DIR__ . '/lib/db.php';
+require_once __DIR__ . '/lib/auth.php';
+
+pp_json_headers();
+pp_check_same_origin();
+pp_require_user();
 
 if (!function_exists('curl_init')) {
     http_response_code(500);

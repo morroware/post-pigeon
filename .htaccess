@@ -1,5 +1,13 @@
-# Post Pigeon — protect persisted JSON from direct download.
+# Post Pigeon — root .htaccess.
+DirectoryIndex index.php index.html app.html
+
+# Block direct download of any persisted JSON (legacy file storage).
 <FilesMatch "\.json$">
   Require all denied
 </FilesMatch>
-DirectoryIndex index.php index.html app.html
+
+# Block direct access to server-only config/schema. lib/.htaccess covers the
+# library directory; this catches the file-level cases at the root.
+<FilesMatch "^(config\.php|schema\.sql|\.env|composer\.(json|lock))$">
+  Require all denied
+</FilesMatch>

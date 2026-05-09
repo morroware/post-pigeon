@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Post Pigeon · sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/styles.css">
+<link rel="stylesheet" href="assets/auth.css">
+</head>
+<body class="auth-body">
+
+<main class="auth-card" id="card">
+  <header class="auth-head">
+    <div class="auth-brand">
+      <svg viewBox="0 0 28 24" width="26" height="22" aria-hidden="true">
+        <path d="M2 15 C5 13 8 13 11 14 L14 9 L17 11 L22 7 L21 13 L25 12 L23 16 L18 19 L12 19 L9 22 L8 19 L5 18 Z" fill="currentColor"/>
+        <circle cx="20.2" cy="9.4" r=".7" fill="#0b0c0e"/>
+        <path d="M22 7 L25.5 6.2 L23 8.2 Z" fill="#d9a441"/>
+      </svg>
+      <strong>POST PIGEON</strong>
+      <span class="auth-sub">self-hosted carrier</span>
+    </div>
+  </header>
+
+  <h1 class="auth-title">Sign in</h1>
+  <p class="muted auth-lead">Use your email or username.</p>
+
+  <form id="login-form" class="auth-form" autocomplete="on" novalidate>
+    <label class="field">
+      <span class="field-label">Email or username</span>
+      <input id="login" name="login" type="text" required autocomplete="username" autofocus>
+    </label>
+    <label class="field">
+      <span class="field-label">Password</span>
+      <input id="password" name="password" type="password" required autocomplete="current-password">
+    </label>
+    <div class="auth-flash auth-flash--err" id="err" hidden></div>
+    <button class="auth-submit" id="submit" type="submit">Sign in</button>
+  </form>
+
+  <p class="muted auth-foot">
+    Need an account? Ask your admin to create one. First-time setup? See
+    <a href="setup.php">setup.php</a>.
+  </p>
+</main>
+
+<script src="assets/auth.js" defer></script>
+</body>
+</html>

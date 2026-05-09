@@ -1,7 +1,7 @@
 /* =============================================================
    Post Pigeon — vanilla JS app
    No frameworks. State is a plain object, persisted to localStorage
-   and (when available) to PHP storage.php on the server.
+   and (when authenticated) to MySQL via api.php on the server.
    ============================================================= */
 
 const $ = (sel, root=document) => root.querySelector(sel);
@@ -17,7 +17,23 @@ const STATE = {
   envs: [],          // [{id, name, vars:[{key,val,enabled}]}]
   activeEnvId: null,
   serverProxy: null, // 'ok' | 'fallback' | null
+  user: null,        // {id, email, username, is_admin, must_change_password, ...}
 };
+
+/* ---------------- HTTP helpers (auth-aware) ---------------- */
+// Wrap fetch so any 401 from our own endpoints kicks us back to login.html
+// rather than silently failing or producing confusing UI states.
+async function ppFetch(url, opts = {}) {
+  const init = { credentials: 'same-origin', ...opts };
+  const r = await fetch(url, init);
+  if (r.status === 401) {
+    const next = encodeURIComponent(location.pathname + location.search);
+    location.replace('login.html?reason=expired&next=' + next);
+    // Returning a never-resolving promise prevents callers from racing the redirect.
+    return new Promise(() => {});
+  }
+  return r;
+}
 
 const newRequest = (over={}) => ({
   id: uid(),
@@ -41,6 +57,11 @@ const newRequest = (over={}) => ({
 
 /* ---------------- Persistence ---------------- */
 const LS_KEY = 'postpigeon.v1';
+// Debounce server writes so a flurry of UI changes coalesces into one PUT.
+let _persistTimer = null;
+let _persistInFlight = false;
+let _persistPending  = false;
+
 async function persist() {
   const snap = {
     collections: STATE.collections,
@@ -49,14 +70,40 @@ async function persist() {
     activeEnvId: STATE.activeEnvId,
   };
   try { localStorage.setItem(LS_KEY, JSON.stringify(snap)); } catch {}
-  // Mirror to server if storage.php is reachable.
+  // Coalesce: schedule one server write 250 ms after the latest change.
+  if (_persistTimer) clearTimeout(_persistTimer);
+  _persistTimer = setTimeout(() => persistFlush(snap), 250);
+}
+
+async function persistFlush(snap) {
+  if (_persistInFlight) { _persistPending = true; return; }
+  _persistInFlight = true;
   try {
-    await fetch('storage.php?action=set&bucket=workspace', {
-      method: 'POST',
+    const r = await ppFetch('api.php?resource=workspace', {
+      method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(snap),
     });
-  } catch {}
+    if (!r.ok && r.status !== 401) {
+      const j = await r.json().catch(() => ({}));
+      console.warn('post-pigeon: workspace save failed', j.error || r.status);
+    }
+  } catch (e) {
+    console.warn('post-pigeon: workspace save error', e);
+  } finally {
+    _persistInFlight = false;
+    if (_persistPending) {
+      _persistPending = false;
+      // Re-snapshot — STATE may have changed while the request was in flight.
+      const next = {
+        collections: STATE.collections,
+        history:     STATE.history.slice(0, 200),
+        envs:        STATE.envs,
+        activeEnvId: STATE.activeEnvId,
+      };
+      persistFlush(next);
+    }
+  }
 }
 // Old rows may have been persisted with {name, value}; the UI binds {key, val}.
 // Normalize so we don't silently drop user-entered headers.
@@ -98,22 +145,33 @@ function applySnapshot(snap) {
   if (typeof snap.activeEnvId === 'string') STATE.activeEnvId = snap.activeEnvId;
 }
 async function hydrate() {
-  // Prefer server snapshot.
+  // Prefer server snapshot (canonical source).
   try {
-    const r = await fetch('storage.php?action=get&bucket=workspace');
+    const r = await ppFetch('api.php?resource=workspace');
     if (r.ok) {
       const j = await r.json();
       if (j && j.data) applySnapshot(j.data);
     }
   } catch {}
-  // Fallback to localStorage.
+  // Fallback to localStorage cache (offline / first run / network blip).
   if (!STATE.collections.length && !STATE.history.length && !STATE.envs.length) {
     try {
       const cached = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
       if (cached) applySnapshot(cached);
     } catch {}
   }
-  if (!STATE.collections.length) seed();
+  if (!STATE.collections.length && !STATE.envs.length) seed();
+}
+
+async function fetchCurrentUser() {
+  try {
+    const r = await ppFetch('auth.php?action=me');
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j.user || null;
+  } catch {
+    return null;
+  }
 }
 
 function seed() {
@@ -201,7 +259,7 @@ async function sendRequest(req) {
   let resp;
   try {
     if (STATE.serverProxy === 'ok') {
-      const r = await fetch('proxy.php', {
+      const r = await ppFetch('proxy.php', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify(payload),
@@ -1263,9 +1321,9 @@ function bindTopbar() {
 async function probeProxy() {
   const el = $('#serverStatus'); const txt = $('#serverStatusText');
   try {
-    // Probe with an empty body. A live proxy.php returns 400 {error:"Missing url"};
-    // anything that is NOT proxy.php (404, HTML 200, etc.) won't match.
-    const r = await fetch('proxy.php', {
+    // Probe with an empty body. A live, authenticated proxy.php returns
+    // 400 {error:"Missing url"} — that's a positive signal.
+    const r = await ppFetch('proxy.php', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: '{}',
@@ -1303,14 +1361,265 @@ function statusText(s) {
   return ({200:'OK',201:'Created',204:'No Content',301:'Moved',302:'Found',304:'Not Modified',400:'Bad Request',401:'Unauthorized',403:'Forbidden',404:'Not Found',409:'Conflict',422:'Unprocessable',429:'Too Many',500:'Server Error',502:'Bad Gateway',503:'Unavailable'})[s] || '';
 }
 
+/* ---------------- Account pill / sign out ---------------- */
+function renderAccountPill() {
+  const pill = $('#accountPill');
+  const name = $('#accountName');
+  const avatar = $('#accountAvatar');
+  const meta = $('#accountMenuEmail');
+  const adminBtn = $('#adminMenuBtn');
+  const u = STATE.user;
+  if (!u) { pill.hidden = true; return; }
+  pill.hidden = false;
+  name.textContent = u.username || u.email || 'account';
+  avatar.textContent = (u.username || u.email || '?').slice(0,1);
+  meta.textContent = u.email || u.username || '';
+  pill.dataset.admin = u.is_admin ? 'true' : 'false';
+  adminBtn.hidden = !u.is_admin;
+}
+function bindAccountPill() {
+  const wrap = $('#accountWrap');
+  const pill = $('#accountPill');
+  const menu = $('#accountMenu');
+  if (!wrap || !pill || !menu) return;
+  pill.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const opening = menu.hidden;
+    menu.hidden = !opening;
+    pill.setAttribute('aria-expanded', String(opening));
+  });
+  // Close on outside click (but never close while interacting with the menu itself).
+  document.addEventListener('click', (e) => {
+    if (!wrap.contains(e.target)) {
+      menu.hidden = true;
+      pill.setAttribute('aria-expanded', 'false');
+    }
+  });
+  menu.querySelector('[data-action="logout"]').addEventListener('click', signOut);
+  menu.querySelector('[data-action="change-password"]').addEventListener('click', () => {
+    menu.hidden = true; openChangePasswordModal();
+  });
+  menu.querySelector('[data-action="open-admin"]').addEventListener('click', () => {
+    menu.hidden = true; openAdminModal();
+  });
+}
+async function signOut() {
+  try {
+    await ppFetch('auth.php?action=logout', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
+  } catch {}
+  // Clear cached workspace so the next user on this machine doesn't see leftover data.
+  try { localStorage.removeItem(LS_KEY); } catch {}
+  location.replace('login.html?reason=logout');
+}
+
+function openChangePasswordModal(forced = false) {
+  const m = openModal(`
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Change password</h2>
+        <span class="modal-sub">${forced ? 'required by admin' : ''}</span>
+      </div>
+      <div class="modal-body">
+        ${forced ? '<p class="muted" style="margin-top:0;font:500 12px var(--mono)">Your admin set a temporary password. Please pick a new one before continuing.</p>' : ''}
+        <label class="field"><span class="field-label">Current password</span><input id="cp-cur" type="password" autocomplete="current-password"></label>
+        <label class="field"><span class="field-label">New password</span><input id="cp-new" type="password" autocomplete="new-password"></label>
+        <label class="field"><span class="field-label">Confirm new password</span><input id="cp-cnf" type="password" autocomplete="new-password"></label>
+        <div class="auth-flash auth-flash--err" id="cp-err" hidden></div>
+      </div>
+      <div class="modal-foot">
+        ${forced ? '' : '<button class="btn-ghost" data-cancel>Cancel</button>'}
+        <button class="btn-primary" id="cp-go">Save</button>
+      </div>
+    </div>`);
+  if (!forced) m.querySelector('[data-cancel]').addEventListener('click', closeModal);
+  const err = m.querySelector('#cp-err');
+  m.querySelector('#cp-go').addEventListener('click', async () => {
+    err.hidden = true;
+    const cur = m.querySelector('#cp-cur').value;
+    const next = m.querySelector('#cp-new').value;
+    const cnf = m.querySelector('#cp-cnf').value;
+    if (!cur || !next) { err.textContent = 'Please fill in every field.'; err.hidden = false; return; }
+    if (next !== cnf)  { err.textContent = 'New passwords do not match.';  err.hidden = false; return; }
+    try {
+      const r = await ppFetch('auth.php?action=change_password', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ current: cur, password: next, confirm: cnf }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || !j.ok) {
+        err.textContent = j.error || 'Could not change password.';
+        err.hidden = false;
+        return;
+      }
+      if (STATE.user) STATE.user.must_change_password = false;
+      closeModal();
+      toast('Password changed', 'ok');
+    } catch (e) {
+      err.textContent = 'Network error.';
+      err.hidden = false;
+    }
+  });
+}
+
+/* ---------------- Admin panel ---------------- */
+let _adminLastTemp = null;
+async function openAdminModal() {
+  if (!STATE.user || !STATE.user.is_admin) return;
+  const m = openModal(`
+    <div class="modal admin-modal">
+      <div class="modal-head"><h2>Users</h2><span class="modal-sub">admin · invite-only</span></div>
+      <div class="modal-body">
+        <div id="adm-banner"></div>
+        <form class="admin-create-form" id="adm-create" autocomplete="off">
+          <label class="field"><span class="field-label">Email</span><input name="email" type="email" required></label>
+          <label class="field"><span class="field-label">Username</span><input name="username" type="text" required pattern="[A-Za-z0-9_.\\-]{3,64}"></label>
+          <label class="field"><span class="field-label">Password (optional)</span><input name="password" type="text" placeholder="leave blank to auto-generate"></label>
+          <label class="field-row"><input name="is_admin" type="checkbox"> grant admin</label>
+          <button type="submit">Create user</button>
+        </form>
+        <table class="admin-table">
+          <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Created</th><th>Last login</th><th></th></tr></thead>
+          <tbody id="adm-rows"><tr><td colspan="6" class="muted" style="padding:14px">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="modal-foot"><button class="btn-ghost" data-cancel>Close</button></div>
+    </div>`);
+  m.querySelector('[data-cancel]').addEventListener('click', closeModal);
+  m.querySelector('#adm-create').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.currentTarget;
+    const body = {
+      email: f.email.value.trim(),
+      username: f.username.value.trim(),
+      password: f.password.value,
+      is_admin: f.is_admin.checked,
+    };
+    if (!body.password) delete body.password;
+    try {
+      const r = await ppFetch('admin.php?action=create', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { toast(j.error || 'Could not create user', 'err'); return; }
+      f.reset();
+      _adminLastTemp = j.temp_password ? { user: j.user, password: j.temp_password } : null;
+      drawAdminBanner();
+      drawAdminRows();
+      toast('User created', 'ok');
+    } catch (ex) {
+      toast('Network error', 'err');
+    }
+  });
+  drawAdminRows();
+  drawAdminBanner();
+}
+
+function drawAdminBanner() {
+  const banner = document.querySelector('#adm-banner');
+  if (!banner) return;
+  banner.innerHTML = '';
+  if (_adminLastTemp) {
+    const { user, password } = _adminLastTemp;
+    const div = document.createElement('div');
+    div.className = 'temp-password-banner';
+    div.innerHTML = `Temporary password for <strong>${escapeHtml(user.username)}</strong>: <code id="adm-temp">${escapeHtml(password)}</code>
+      <button type="button">Copy</button>`;
+    div.querySelector('button').addEventListener('click', () => {
+      navigator.clipboard.writeText(password);
+      toast('Copied — share securely', 'ok');
+    });
+    banner.appendChild(div);
+  }
+}
+
+async function drawAdminRows() {
+  const tbody = document.querySelector('#adm-rows');
+  if (!tbody) return;
+  try {
+    const r = await ppFetch('admin.php?action=list');
+    const j = await r.json();
+    if (!r.ok) { tbody.innerHTML = `<tr><td colspan="6" class="muted">${escapeHtml(j.error || 'load failed')}</td></tr>`; return; }
+    tbody.innerHTML = '';
+    for (const u of j.users) {
+      const tr = document.createElement('tr');
+      const me = STATE.user && STATE.user.id === u.id;
+      tr.innerHTML = `
+        <td><strong>${escapeHtml(u.username)}</strong><br><span class="muted" style="font-size:11px">${escapeHtml(u.email)}</span></td>
+        <td><span class="admin-pill" data-on="${u.is_admin?'true':'false'}">${u.is_admin?'admin':'user'}</span></td>
+        <td><span class="admin-pill" data-on="${u.is_active?'true':'false'}">${u.is_active?'active':'disabled'}</span></td>
+        <td>${escapeHtml((u.created_at||'').slice(0,10))}</td>
+        <td>${escapeHtml((u.last_login_at||'').slice(0,16) || '—')}</td>
+        <td class="admin-actions">
+          <button class="ghost-btn" data-act="reset">reset pw</button>
+          ${me ? '' : `<button class="ghost-btn" data-act="${u.is_admin?'demote':'promote'}">${u.is_admin?'demote':'promote'}</button>`}
+          ${me ? '' : `<button class="ghost-btn" data-act="${u.is_active?'disable':'enable'}">${u.is_active?'disable':'enable'}</button>`}
+          ${me ? '' : `<button class="ghost-btn" data-act="delete" data-danger="true">delete</button>`}
+        </td>`;
+      tr.querySelectorAll('button').forEach(b => b.addEventListener('click', () => adminRowAction(u, b.dataset.act)));
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="muted">Network error.</td></tr>`;
+  }
+}
+
+async function adminRowAction(u, act) {
+  let url = '', body = {};
+  if (act === 'reset') {
+    if (!confirm(`Reset password for ${u.username}? They will be forced to change it on next login.`)) return;
+    url = 'admin.php?action=reset_password'; body = { id: u.id };
+  } else if (act === 'promote' || act === 'demote') {
+    url = 'admin.php?action=set_admin'; body = { id: u.id, is_admin: act === 'promote' };
+  } else if (act === 'enable' || act === 'disable') {
+    url = 'admin.php?action=set_active'; body = { id: u.id, is_active: act === 'enable' };
+  } else if (act === 'delete') {
+    if (!confirm(`Permanently delete ${u.username} and all their data? This cannot be undone.`)) return;
+    url = 'admin.php?action=delete'; body = { id: u.id };
+  } else { return; }
+  try {
+    const r = await ppFetch(url, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { toast(j.error || 'Action failed', 'err'); return; }
+    if (act === 'reset' && j.temp_password) {
+      _adminLastTemp = { user: u, password: j.temp_password };
+      drawAdminBanner();
+    }
+    drawAdminRows();
+    toast('Done', 'ok');
+  } catch (e) {
+    toast('Network error', 'err');
+  }
+}
+
 /* ---------------- Boot ---------------- */
 (async function init() {
+  // Auth: get the current user. If we're somehow on this page without a
+  // session, ppFetch will redirect to login.html, but server-side index.php
+  // should have already done that.
+  STATE.user = await fetchCurrentUser();
+  if (!STATE.user) { location.replace('login.html'); return; }
+
   await hydrate();
+  renderAccountPill();
+  bindAccountPill();
   renderSidebar();
   bindTopbar();
   // Await the probe so the very first Send picks the right path
   // (proxy vs. direct fetch fallback) instead of racing the network.
   await probeProxy();
+
+  // Force the password-change modal if the admin set a temp password.
+  if (STATE.user.must_change_password) {
+    openChangePasswordModal(/* forced */ true);
+  }
+
   // Open one tab to start
   const seedReq = STATE.collections[0]?.requests[0] || newRequest({ method:'GET', url:'https://httpbin.org/get?hello={{baseUrl}}' });
   openRequestInTab(seedReq);
