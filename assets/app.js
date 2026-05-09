@@ -19,7 +19,7 @@ const STATE = {
   serverProxy: null, // 'ok' | 'fallback' | null
 };
 
-const newRequest = (over={}) => ({
+const newRequest = (over={}) => normalizeRequest({
   id: uid(),
   name: 'Untitled',
   method: 'GET',
@@ -39,9 +39,60 @@ const newRequest = (over={}) => ({
   ...over,
 });
 
+// Hydrates a (possibly-old) request to the current schema. Used whenever a
+// request enters the app from external data — collections, history, imports.
+// Don't trust the shape of anything we read off disk.
+function normalizeRequest(r = {}) {
+  const out = { ...r };
+  out.id          = r.id || uid();
+  out.name        = r.name || 'Untitled';
+  // method must be ASCII letters only — interpolated into HTML attributes
+  // and data-m="" downstream, so we lock it down at the entry point.
+  const m         = String(r.method || 'GET').toUpperCase();
+  out.method      = /^[A-Z]+$/.test(m) ? m : 'GET';
+  out.url         = r.url || '';
+  out.description = r.description || '';
+  out.prescript   = r.prescript || '';
+  out.tests       = r.tests || '';
+  for (const k of ['params','headers','form','urlencoded']) {
+    out[k] = Array.isArray(r[k]) ? r[k] : [];
+  }
+  const b = (r.body && typeof r.body === 'object') ? r.body : {};
+  out.body = {
+    mode:    b.mode || 'none',
+    raw:     b.raw || '',
+    rawType: b.rawType || 'json',
+    binary:  b.binary ?? null,
+  };
+  const a = (r.auth && typeof r.auth === 'object') ? r.auth : {};
+  out.auth = {
+    type:   a.type || 'none',
+    basic:  { user: a.basic?.user || '',  pass: a.basic?.pass || '' },
+    bearer: { token: a.bearer?.token || '' },
+    apikey: { key: a.apikey?.key || '', value: a.apikey?.value || '', in: a.apikey?.in || 'header' },
+  };
+  const s = (r.settings && typeof r.settings === 'object') ? r.settings : {};
+  out.settings = {
+    followRedirects: !!s.followRedirects,
+    verifySSL:       s.verifySSL !== false,
+    timeout:         Number.isFinite(+s.timeout) && +s.timeout > 0 ? +s.timeout : 30,
+  };
+  out.response    = r.response || null;
+  out.testResults = Array.isArray(r.testResults) ? r.testResults : [];
+  return out;
+}
+
 /* ---------------- Persistence ---------------- */
 const LS_KEY = 'postpigeon.v1';
-async function persist() {
+const PERSIST_KEYS = ['collections', 'history', 'envs', 'activeEnvId'];
+function applySnapshot(snap) {
+  if (!snap || typeof snap !== 'object') return;
+  for (const k of PERSIST_KEYS) {
+    if (snap[k] !== undefined) STATE[k] = snap[k];
+  }
+}
+let persistTimer = null;
+async function persistNow() {
   const snap = {
     collections: STATE.collections,
     history:     STATE.history.slice(0, 200),
@@ -58,23 +109,29 @@ async function persist() {
     });
   } catch {}
 }
+function persist() {
+  // Debounce server writes — prevents a flood of POSTs while users type.
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(persistNow, 200);
+}
 async function hydrate() {
-  // Prefer server snapshot.
+  let merged = null;
+  try {
+    const cached = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
+    if (cached && typeof cached === 'object') merged = cached;
+  } catch {}
+  // Server snapshot wins per-key when present, but missing keys keep their cached value.
   try {
     const r = await fetch('storage.php?action=get&bucket=workspace');
     if (r.ok) {
       const j = await r.json();
-      if (j && j.data) Object.assign(STATE, j.data);
+      if (j && j.data && typeof j.data === 'object') merged = { ...(merged||{}), ...j.data };
     }
   } catch {}
-  // Fallback to localStorage.
-  if (!STATE.collections.length && !STATE.history.length && !STATE.envs.length) {
-    try {
-      const cached = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
-      if (cached) Object.assign(STATE, cached);
-    } catch {}
-  }
-  if (!STATE.collections.length) seed();
+  applySnapshot(merged);
+  if (!Array.isArray(STATE.collections) || !STATE.collections.length) seed();
+  if (!Array.isArray(STATE.envs)) STATE.envs = [];
+  if (!Array.isArray(STATE.history)) STATE.history = [];
 }
 
 function seed() {
@@ -136,10 +193,12 @@ function highlightVars(text) {
 
 /* ---------------- Send ---------------- */
 async function sendRequest(req) {
-  // Apply pre-request script (sandboxed).
+  // Apply pre-request script (sandboxed). Surface errors so users can debug.
   try {
     runUserScript(req.prescript, { req });
-  } catch (e) { /* swallow */ }
+  } catch (e) {
+    toast('Pre-request script error: ' + (e.message || e), 'err');
+  }
 
   // Build the actual request after variable substitution.
   const url = buildUrl(req);
@@ -168,7 +227,13 @@ async function sendRequest(req) {
     } else {
       // Direct fetch fallback (will hit CORS for many APIs).
       const init = { method: req.method, headers: {} };
-      for (const h of headers) if (h.name) init.headers[h.name] = h.value || '';
+      for (const h of headers) {
+        if (!h.name) continue;
+        // Some headers are forbidden by the Fetch spec (Cookie, Host, etc.) and
+        // throw when assigned. Skip individually so one bad header doesn't kill
+        // the whole request.
+        try { init.headers[h.name] = h.value || ''; } catch {}
+      }
       if (body && !['GET','HEAD'].includes(req.method)) init.body = body;
       const r = await fetch(url, init);
       const txt = await r.text();
@@ -176,7 +241,7 @@ async function sendRequest(req) {
       resp = {
         status: r.status, headers: hdrs, body: txt,
         timeMs: Math.round(performance.now() - t0),
-        sizeBytes: txt.length, finalUrl: r.url, redirects: 0,
+        sizeBytes: new Blob([txt]).size, finalUrl: r.url, redirects: 0,
       };
     }
   } catch (err) {
@@ -193,40 +258,49 @@ async function sendRequest(req) {
     timeMs: resp.timeMs || 0, snapshot: structuredClone(simplify(req)),
   });
   STATE.history = STATE.history.slice(0, 200);
-  await persist();
+  // Bypass the 200ms debounce — we want history flushed before the user
+  // navigates away from a freshly-sent request.
+  await persistNow();
 }
 
 function buildUrl(req) {
   let url = resolveVars(req.url || '');
-  const params = req.params.filter(p => p.enabled !== false && p.key);
-  if (params.length) {
-    const search = params.map(p =>
-      encodeURIComponent(resolveVars(p.key)) + '=' + encodeURIComponent(resolveVars(p.val||''))).join('&');
+  const pairs = (req.params || []).filter(p => p.enabled !== false && p.key)
+    .map(p => [resolveVars(p.key), resolveVars(p.val||'')]);
+  // API key auth → query mode injects an extra pair.
+  const a = req.auth || {};
+  if (a.type === 'apikey' && a.apikey && a.apikey.in === 'query' && a.apikey.key) {
+    pairs.push([resolveVars(a.apikey.key), resolveVars(a.apikey.value||'')]);
+  }
+  if (pairs.length) {
+    const search = pairs.map(([k,v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
     url += (url.includes('?') ? '&' : '?') + search;
   }
   return url;
 }
 function buildHeaders(req) {
-  const out = req.headers.filter(h => h.enabled !== false && h.name)
-    .map(h => ({ name: resolveVars(h.name), value: resolveVars(h.value || '') }));
+  // Headers may be stored as {key,val} (UI editor) or {name,value} (legacy/import).
+  // Normalize to {name, value}.
+  const out = (req.headers || [])
+    .map(h => ({ name: h.name ?? h.key ?? '', value: h.value ?? h.val ?? '', enabled: h.enabled }))
+    .filter(h => h.enabled !== false && h.name)
+    .map(h => ({ name: resolveVars(h.name), value: resolveVars(h.value) }));
   // Auth
-  const a = req.auth;
-  if (a.type === 'basic' && a.basic.user) {
+  const a = req.auth || {};
+  if (a.type === 'basic' && a.basic && a.basic.user) {
     out.push({ name: 'Authorization', value: 'Basic ' + btoa(resolveVars(a.basic.user)+':'+resolveVars(a.basic.pass||'')) });
-  } else if (a.type === 'bearer' && a.bearer.token) {
+  } else if (a.type === 'bearer' && a.bearer && a.bearer.token) {
     out.push({ name: 'Authorization', value: 'Bearer ' + resolveVars(a.bearer.token) });
-  } else if (a.type === 'apikey' && a.apikey.key) {
-    if (a.apikey.in === 'header') out.push({ name: resolveVars(a.apikey.key), value: resolveVars(a.apikey.value || '') });
+  } else if (a.type === 'apikey' && a.apikey && a.apikey.key && (a.apikey.in||'header') === 'header') {
+    out.push({ name: resolveVars(a.apikey.key), value: resolveVars(a.apikey.value || '') });
   }
   // Body content-type defaults
-  if (req.body.mode === 'raw') {
+  const hasCT = () => out.some(h => h.name.toLowerCase() === 'content-type');
+  if (req.body.mode === 'raw' && !hasCT()) {
     const map = { json:'application/json', xml:'application/xml', html:'text/html', text:'text/plain', javascript:'application/javascript' };
-    if (!out.some(h => h.name.toLowerCase() === 'content-type')) {
-      out.push({ name: 'Content-Type', value: map[req.body.rawType] || 'text/plain' });
-    }
-  } else if (req.body.mode === 'urlencoded') {
-    if (!out.some(h => h.name.toLowerCase() === 'content-type'))
-      out.push({ name: 'Content-Type', value: 'application/x-www-form-urlencoded' });
+    out.push({ name: 'Content-Type', value: map[req.body.rawType] || 'text/plain' });
+  } else if (req.body.mode === 'urlencoded' && !hasCT()) {
+    out.push({ name: 'Content-Type', value: 'application/x-www-form-urlencoded' });
   }
   return out;
 }
@@ -300,7 +374,9 @@ function activeTab() { return STATE.tabs.find(t => t.id === STATE.activeTabId); 
 
 function openRequestInTab(req) {
   const id = uid();
-  const tab = { id, name: req.name || nameFromUrl(req.url) || 'Untitled', request: structuredClone(req) };
+  const cloned = structuredClone(req || {});
+  const normalized = normalizeRequest(cloned);
+  const tab = { id, name: normalized.name || nameFromUrl(normalized.url) || 'Untitled', request: normalized };
   STATE.tabs.push(tab);
   STATE.activeTabId = id;
   renderTabs();
@@ -315,8 +391,10 @@ function renderTabs() {
     const el = document.createElement('div');
     el.className = 'tab' + (t.id === STATE.activeTabId ? ' is-active' : '');
     el.dataset.tabId = t.id;
+    el.dataset.dirty = t.dirty ? 'true' : 'false';
+    const method = escapeHtml(t.request.method);
     el.innerHTML = `
-      <span class="tab-method method-tag" data-m="${t.request.method}">${t.request.method}</span>
+      <span class="tab-method method-tag" data-m="${method}">${method}</span>
       <span class="tab-name">${escapeHtml(t.name)}</span>
       <span class="tab-dot"></span>
       <button class="tab-close" title="Close">×</button>`;
@@ -448,12 +526,20 @@ function bindPanel(panel, tab) {
   // ---- Send
   const sendBtn = $('[data-action="send"]', panel);
   sendBtn.addEventListener('click', async () => {
+    if (sendBtn.dataset.loading === 'true') return; // prevent double-send
     sendBtn.dataset.loading = 'true';
-    await sendRequest(r);
-    sendBtn.dataset.loading = 'false';
-    renderResponse(panel, r);
-    renderHistory();
-    updateBadges();
+    sendBtn.disabled = true;
+    try {
+      await sendRequest(r);
+      renderResponse(panel, r);
+      renderHistory();
+    } catch (e) {
+      toast('Send failed: ' + (e.message || e), 'err');
+    } finally {
+      sendBtn.dataset.loading = 'false';
+      sendBtn.disabled = false;
+      updateBadges();
+    }
   });
 
   // ---- Save / code-gen
@@ -467,14 +553,7 @@ function bindPanel(panel, tab) {
   renderResponse(panel, r);
 
   updateBadges();
-  function updateBadges() {
-    panel.querySelector('[data-count="params"]').textContent = (r.params.filter(p=>p.enabled!==false&&p.key).length||'');
-    panel.querySelector('[data-count="headers"]').textContent = (r.headers.filter(p=>p.enabled!==false&&p.name).length||'');
-    const bodyCount = r.body.mode==='none' ? '' :
-      r.body.mode==='raw' ? (r.body.raw?'•':'') :
-      (r[r.body.mode] || []).filter(p=>p.enabled!==false&&p.key).length || '';
-    panel.querySelector('[data-count="body"]').textContent = bodyCount;
-  }
+  function updateBadges() { updatePanelBadges(panel); }
 
   // Keyboard shortcut: Ctrl/Cmd+Enter to send
   panel.addEventListener('keydown', e => {
@@ -495,7 +574,20 @@ function bindBindings(panel, r, tab) {
       o[parts.at(-1)] = v;
     };
     if (el.type === 'checkbox') { el.checked = !!get(); el.addEventListener('change', ()=>{set(el.checked); markDirty(tab);}); }
-    else { el.value = get() ?? ''; el.addEventListener('input', ()=>{set(el.type==='number'?+el.value:el.value); markDirty(tab);}); }
+    else {
+      el.value = get() ?? '';
+      el.addEventListener('input', () => {
+        let v = el.value;
+        if (el.type === 'number') {
+          const n = parseFloat(v);
+          // Clamp to the input's own min/max if present so timeouts stay sane.
+          const min = el.min !== '' ? parseFloat(el.min) : -Infinity;
+          const max = el.max !== '' ? parseFloat(el.max) :  Infinity;
+          v = Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : (Number.isFinite(min) ? min : 0);
+        }
+        set(v); markDirty(tab);
+      });
+    }
   });
 }
 
@@ -522,37 +614,57 @@ function bindSubtabs(root, tabsSel, paneAncestorSel) {
 
 function bindKV(panel, target) {
   const list = $(`[data-rows="${target}"]`, panel);
-  const tab = activeTab(); const arr = tab.request[target];
+  const tab = activeTab(); if (!tab) return;
+  if (!Array.isArray(tab.request[target])) tab.request[target] = [];
+  const arr = tab.request[target];
   list.innerHTML = '';
-  arr.forEach(row => list.appendChild(buildKVRow(target, row)));
+  arr.forEach(row => list.appendChild(buildKVRow(target, row, tab, panel)));
   // ensure at least one empty row for entry
-  if (!arr.length) { addRow(target); }
-  $(`[data-action="add-row"][data-row-target="${target}"]`, panel).addEventListener('click', () => addRow(target));
+  if (!arr.length) { addRow(target, panel); }
+  $(`[data-action="add-row"][data-row-target="${target}"]`, panel)
+    .addEventListener('click', () => addRow(target, panel));
 }
-function addRow(target) {
-  const tab = activeTab();
+function addRow(target, panel) {
+  const tab = activeTab(); if (!tab) return;
   const row = { key:'', val:'', desc:'', enabled:true };
   tab.request[target].push(row);
-  const list = document.querySelector(`[data-rows="${target}"]`);
-  list.appendChild(buildKVRow(target, row));
+  const scope = panel || document;
+  const list = scope.querySelector(`[data-rows="${target}"]`);
+  if (list) list.appendChild(buildKVRow(target, row, tab, panel));
 }
-function buildKVRow(target, row) {
+function buildKVRow(target, row, tab, panel) {
   const tpl = $('#tpl-kv-row').content.cloneNode(true);
   const el = tpl.querySelector('.kv-row');
   el.dataset.disabled = (row.enabled === false);
+  const dirty = () => { if (tab) markDirty(tab); if (panel) updatePanelBadges(panel); };
   const c = el.querySelector('.kv-check');
   c.checked = row.enabled !== false;
-  c.addEventListener('change', () => { row.enabled = c.checked; el.dataset.disabled = !c.checked; });
-  const k = el.querySelector('.kv-key'); k.value = row.key;  k.addEventListener('input', () => row.key = k.value);
-  const v = el.querySelector('.kv-val'); v.value = row.val;  v.addEventListener('input', () => row.val = v.value);
-  const d = el.querySelector('.kv-desc'); d.value = row.desc||''; d.addEventListener('input', () => row.desc = d.value);
+  c.addEventListener('change', () => {
+    row.enabled = c.checked; el.dataset.disabled = !c.checked; dirty();
+  });
+  const k = el.querySelector('.kv-key'); k.value = row.key||'';  k.addEventListener('input', () => { row.key = k.value; dirty(); });
+  const v = el.querySelector('.kv-val'); v.value = row.val||'';  v.addEventListener('input', () => { row.val = v.value; dirty(); });
+  const d = el.querySelector('.kv-desc'); d.value = row.desc||''; d.addEventListener('input', () => { row.desc = d.value; dirty(); });
   if (target === 'form') d.placeholder = 'text · file';
   el.querySelector('.kv-del').addEventListener('click', () => {
-    const arr = activeTab().request[target];
-    const i = arr.indexOf(row); if (i>=0) arr.splice(i,1);
-    el.remove();
+    const arr = tab ? tab.request[target] : null;
+    if (arr) { const i = arr.indexOf(row); if (i>=0) arr.splice(i,1); }
+    el.remove(); dirty();
   });
   return el;
+}
+// Helper used by KV/body handlers to refresh subtab counts without re-rendering.
+function updatePanelBadges(panel) {
+  const tab = activeTab(); if (!tab) return;
+  const r = tab.request;
+  const set = (sel, n) => { const el = panel.querySelector(sel); if (el) el.textContent = n || ''; };
+  set('[data-count="params"]',  (r.params||[]).filter(p => p.enabled !== false && p.key).length);
+  set('[data-count="headers"]', (r.headers||[]).filter(p => p.enabled !== false && (p.name || p.key)).length);
+  const bodyCount = r.body.mode==='none' ? '' :
+    r.body.mode==='raw' ? (r.body.raw?'•':'') :
+    r.body.mode==='binary' ? (r.body.binary?'•':'') :
+    (r[r.body.mode] || []).filter(p => p.enabled !== false && p.key).length || '';
+  set('[data-count="body"]', bodyCount);
 }
 
 /* ---------------- Splitter ---------------- */
@@ -592,11 +704,11 @@ function renderResponse(panel, r) {
     body.innerHTML = `<div class="resp-error">⚠ ${escapeHtml(res.error)}</div>`;
     return;
   }
-  const cls = String(res.status)[0];
+  const cls = (typeof res.status === 'number' && res.status > 0) ? String(res.status)[0] : '5';
   const sizeKb = res.sizeBytes ? (res.sizeBytes/1024).toFixed(1) : '0';
   meta.innerHTML = `
-    <span class="status-pill" data-class="${cls}">${res.status} ${statusText(res.status)}</span>
-    <span class="resp-meta-item">⏱ <strong>${res.timeMs} ms</strong></span>
+    <span class="status-pill" data-class="${cls}">${res.status||0} ${statusText(res.status)}</span>
+    <span class="resp-meta-item">⏱ <strong>${res.timeMs||0} ms</strong></span>
     <span class="resp-meta-item">⇣ <strong>${sizeKb} KB</strong></span>
     ${res.redirects?`<span class="resp-meta-item">↻ ${res.redirects} redirects</span>`:''}
     <span class="resp-meta-spacer"></span>
@@ -610,22 +722,25 @@ function renderResponse(panel, r) {
     const blob = new Blob([res.body || ''], {type: 'text/plain'});
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
     a.download = 'response.txt'; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 0);
   });
 
   $('[data-bodyviewmode]', panel).hidden = false;
   $('.resp-search', panel).hidden = false;
 
-  // Subtab switching
-  const respTabs = $$('.subtab', tabsBar);
-  respTabs.forEach(t => t.classList.remove('is-active'));
-  respTabs[0].classList.add('is-active');
+  // Subtab switching — clone each button to drop any stale listeners from prior renders.
+  // (renderResponse runs once per Send; the panel DOM persists between sends.)
+  const oldRespTabs = $$('.subtab', tabsBar);
+  const respTabs = oldRespTabs.map(t => { const c = t.cloneNode(true); t.replaceWith(c); return c; });
+  respTabs.forEach((t, i) => t.classList.toggle('is-active', i === 0));
   respTabs.forEach(t => t.addEventListener('click', () => {
     respTabs.forEach(x => x.classList.toggle('is-active', x===t));
     drawRespBody(t.dataset.subtab);
   }));
 
   // View mode
-  const vmBtns = $$('[data-bodyviewmode] .seg', panel);
+  const oldVmBtns = $$('[data-bodyviewmode] .seg', panel);
+  const vmBtns = oldVmBtns.map(b => { const c = b.cloneNode(true); b.replaceWith(c); return c; });
   let viewMode = 'pretty';
   vmBtns.forEach(b => b.addEventListener('click', () => {
     vmBtns.forEach(x => x.classList.toggle('is-active', x===b));
@@ -634,38 +749,47 @@ function renderResponse(panel, r) {
 
   // Search
   let searchTerm = '';
-  const searchInput = panel.querySelector('[data-action="search-resp"]');
+  const oldSearch = panel.querySelector('[data-action="search-resp"]');
+  const searchInput = oldSearch.cloneNode(true);
+  oldSearch.replaceWith(searchInput);
+  searchInput.value = '';
   searchInput.addEventListener('input', () => { searchTerm = searchInput.value; drawRespBody('body'); });
 
   // Header/test counts
-  panel.querySelector('[data-count="resp-headers"]').textContent = res.headers.length || '';
-  panel.querySelector('[data-count="resp-tests"]').textContent = r.testResults.length || '';
+  panel.querySelector('[data-count="resp-headers"]').textContent = res.headers ? (res.headers.length || '') : '';
+  panel.querySelector('[data-count="resp-tests"]').textContent = (r.testResults && r.testResults.length) || '';
 
   drawRespBody('body');
 
   function drawRespBody(which) {
     body.innerHTML = '';
     if (which === 'body') {
-      const ct = (res.headers.find(h => h.name.toLowerCase()==='content-type')||{}).value || '';
-      const isJson = ct.includes('json') || /^[\s\[{]/.test(res.body || '');
-      const pre = document.createElement('pre');
-      pre.className = 'resp-pre';
-      let txt = res.body || '';
-      if (viewMode === 'pretty' && isJson) {
-        try { txt = JSON.stringify(JSON.parse(res.body), null, 2); }
-        catch {}
-        pre.innerHTML = colorJson(txt, searchTerm);
-      } else if (viewMode === 'preview' && ct.includes('html')) {
+      const ct = ((res.headers||[]).find(h => h.name && h.name.toLowerCase()==='content-type')||{}).value || '';
+      const rawBody = res.body || '';
+      const isJson = ct.includes('json') || /^[\s\[{]/.test(rawBody);
+      const isHtml = ct.includes('html');
+      if (viewMode === 'preview' && isHtml) {
         const iframe = document.createElement('iframe');
         iframe.style.cssText = 'flex:1; width:100%; border:0; background:#fff;';
-        iframe.srcdoc = res.body || '';
+        // sandbox out scripts/forms — preview is a renderer, not a runtime.
+        iframe.setAttribute('sandbox', '');
+        iframe.srcdoc = rawBody;
         body.appendChild(iframe); return;
+      }
+      const pre = document.createElement('pre');
+      pre.className = 'resp-pre';
+      let txt = rawBody;
+      if (viewMode === 'pretty' && isJson) {
+        try { txt = JSON.stringify(JSON.parse(rawBody), null, 2); }
+        catch {}
+        pre.innerHTML = colorJson(txt, searchTerm);
       } else {
-        pre.textContent = txt;
         if (searchTerm) {
           const safe = escapeHtml(txt);
           const re = new RegExp(escapeRegex(searchTerm), 'gi');
           pre.innerHTML = safe.replace(re, m => `<span class="search-hit">${m}</span>`);
+        } else {
+          pre.textContent = txt;
         }
       }
       body.appendChild(pre);
@@ -676,10 +800,12 @@ function renderResponse(panel, r) {
       return;
     }
     if (which === 'cookies') {
-      const setCookie = res.headers.filter(h => h.name.toLowerCase()==='set-cookie');
+      const setCookie = (res.headers||[]).filter(h => h.name && h.name.toLowerCase()==='set-cookie');
       if (!setCookie.length) { body.innerHTML = '<p class="muted" style="padding:18px">No cookies in response.</p>'; return; }
       body.appendChild(buildKvTable('Cookie', setCookie.map(h => {
-        const m = (h.value||'').split(';')[0].split('='); return [m[0], m[1]||''];
+        const first = (h.value||'').split(';')[0];
+        const eq = first.indexOf('=');
+        return eq < 0 ? [first, ''] : [first.slice(0, eq), first.slice(eq+1)];
       })));
       return;
     }
@@ -697,19 +823,21 @@ function renderResponse(panel, r) {
       body.appendChild(wrap); return;
     }
     if (which === 'timeline') {
-      const total = res.timeMs || 0;
+      const total = Math.max(0, res.timeMs || 0);
       // synthetic split (proxy doesn't expose phases)
       const dns = Math.round(total*0.05), tcp = Math.round(total*0.10),
-            tls = Math.round(total*0.10), wait = Math.round(total*0.65),
-            dl  = total - dns - tcp - tls - wait;
+            tls = Math.round(total*0.10), wait = Math.round(total*0.65);
+      const dl  = Math.max(0, total - dns - tcp - tls - wait);
+      const denom = total || 1;
+      const pct = n => (n / denom * 100).toFixed(2);
       const wrap = document.createElement('div'); wrap.className = 'timeline';
       wrap.innerHTML = `
         <div class="timeline-bar">
-          <span class="seg-dns" style="width:${dns/total*100}%"></span>
-          <span class="seg-tcp" style="width:${tcp/total*100}%"></span>
-          <span class="seg-tls" style="width:${tls/total*100}%"></span>
-          <span class="seg-wait" style="width:${wait/total*100}%"></span>
-          <span class="seg-download" style="width:${dl/total*100}%"></span>
+          <span class="seg-dns" style="width:${pct(dns)}%"></span>
+          <span class="seg-tcp" style="width:${pct(tcp)}%"></span>
+          <span class="seg-tls" style="width:${pct(tls)}%"></span>
+          <span class="seg-wait" style="width:${pct(wait)}%"></span>
+          <span class="seg-download" style="width:${pct(dl)}%"></span>
         </div>
         <div class="timeline-legend">
           <span><i class="seg-dns" style="background:#5b8def"></i>DNS ${dns} ms</span>
@@ -736,10 +864,17 @@ function buildKvTable(keyLabel, rows) {
   t.appendChild(tb); return t;
 }
 
-/* ---------------- JSON colorizer ---------------- */
+/* ---------------- JSON colorizer ----------------
+   Highlight matches BEFORE colorizing so the search regex never collides
+   with span markup. We use a placeholder pair ( …) that can't
+   appear in JSON text, then escape, then swap placeholders for spans. */
 function colorJson(src, searchTerm='') {
-  const escaped = escapeHtml(src);
-  let out = escaped
+  let staged = String(src);
+  if (searchTerm) {
+    const re = new RegExp(escapeRegex(searchTerm), 'gi');
+    staged = staged.replace(re, m => ` ${m}`);
+  }
+  let out = escapeHtml(staged)
     .replace(/(&quot;[^&\\]*?(?:\\.[^&\\]*?)*&quot;)\s*:/g, '<span class="tok-key">$1</span>:')
     .replace(/:\s*(&quot;[^&\\]*?(?:\\.[^&\\]*?)*&quot;)/g, ': <span class="tok-str">$1</span>')
     .replace(/\b(true|false)\b/g, '<span class="tok-bool">$1</span>')
@@ -747,8 +882,7 @@ function colorJson(src, searchTerm='') {
     .replace(/(?<![&\w])(-?\d+\.?\d*(?:e[+-]?\d+)?)/gi, '<span class="tok-num">$1</span>')
     .replace(/([{}\[\],])/g, '<span class="tok-punct">$1</span>');
   if (searchTerm) {
-    const re = new RegExp(escapeRegex(searchTerm), 'gi');
-    out = out.replace(re, m => `<span class="search-hit">${m}</span>`);
+    out = out.replace(/ ([^]*)/g, '<span class="search-hit">$1</span>');
   }
   return out;
 }
@@ -787,7 +921,8 @@ function renderCollections() {
     const kids = g.querySelector('.tree-children');
     col.requests.forEach(req => {
       const leaf = document.createElement('div'); leaf.className = 'tree-leaf';
-      leaf.innerHTML = `<span class="method-tag" data-m="${req.method}">${req.method}</span>
+      const method = escapeHtml(req.method || 'GET');
+      leaf.innerHTML = `<span class="method-tag" data-m="${method}">${method}</span>
                        <span class="tree-leaf-name">${escapeHtml(req.name || nameFromUrl(req.url))}</span>`;
       leaf.addEventListener('click', () => openRequestInTab(req));
       kids.appendChild(leaf);
@@ -800,18 +935,22 @@ function renderHistory() {
   if (!STATE.history.length) { tree.innerHTML = '<p class="muted" style="padding:14px;font:500 12px var(--mono)">No history yet.</p>'; return; }
   for (const h of STATE.history) {
     const leaf = document.createElement('div'); leaf.className = 'tree-leaf';
-    const status = h.status ? `<span class="tree-leaf-time">${h.status}</span>` : '';
-    leaf.innerHTML = `<span class="method-tag" data-m="${h.method}">${h.method}</span>
-                     <span class="tree-leaf-name">${escapeHtml(h.url)}</span> ${status}
-                     <span class="tree-leaf-time">${timeAgo(h.ts)}</span>`;
-    leaf.addEventListener('click', () => openRequestInTab(h.snapshot));
+    const method = escapeHtml(h.method || 'GET');
+    const status = h.status ? `<span class="tree-leaf-time">${escapeHtml(String(h.status))}</span>` : '';
+    leaf.innerHTML = `<span class="method-tag" data-m="${method}">${method}</span>
+                     <span class="tree-leaf-name">${escapeHtml(h.url || '')}</span> ${status}
+                     <span class="tree-leaf-time">${escapeHtml(timeAgo(h.ts))}</span>`;
+    leaf.addEventListener('click', () => openRequestInTab(h.snapshot || {}));
     tree.appendChild(leaf);
   }
 }
 function renderEnvs() {
   const tree = $('#envTree'); tree.innerHTML = '';
   for (const env of STATE.envs) {
-    const g = document.createElement('div'); g.className = 'tree-group'; g.dataset.open = false;
+    const g = document.createElement('div'); g.className = 'tree-group';
+    // Open state lives on the env itself so renderEnvs() (called on every
+    // keystroke in the editor) doesn't slam the group closed.
+    g.dataset.open = env.open ? 'true' : 'false';
     const isActive = env.id === STATE.activeEnvId;
     g.innerHTML = `
       <div class="tree-group-header">
@@ -821,13 +960,15 @@ function renderEnvs() {
       </div>
       <div class="tree-children"></div>`;
     g.querySelector('.tree-group-header').addEventListener('click', () => {
-      g.dataset.open = (g.dataset.open !== 'true');
+      env.open = (g.dataset.open !== 'true');
+      g.dataset.open = env.open ? 'true' : 'false';
     });
     const kids = g.querySelector('.tree-children');
     env.vars.forEach(v => {
       const row = document.createElement('div'); row.className = 'tree-leaf';
+      const preview = String(v.val||'').slice(0, 20);
       row.innerHTML = `<span class="tree-leaf-name"><code>{{${escapeHtml(v.key)}}}</code></span>
-                      <span class="tree-leaf-time">${escapeHtml(v.val||'').slice(0,20)}</span>`;
+                      <span class="tree-leaf-time">${escapeHtml(preview)}</span>`;
       kids.appendChild(row);
     });
     const setBtn = document.createElement('button'); setBtn.className = 'ghost-btn ghost-btn--row';
@@ -893,10 +1034,13 @@ function openSaveModal(tab) {
       STATE.collections.push(c); colId = c.id;
     }
     const col = STATE.collections.find(c => c.id === colId);
+    if (!col) { toast('Collection not found', 'err'); return; }
     const stored = structuredClone(simplify(tab.request));
+    stored.id = uid(); // fresh id so re-saving the same tab doesn't duplicate
     stored.name = name;
     col.requests.push(stored);
     tab.name = name; tab.dirty = false;
+    const tabEl = $(`.tab[data-tab-id="${tab.id}"]`); if (tabEl) tabEl.dataset.dirty = 'false';
     closeModal(); renderTabs(); renderCollections(); persist();
     toast('Saved to ' + col.name, 'ok');
   });
@@ -1054,19 +1198,30 @@ function openImportModal() {
   });
 }
 function parseCurl(s) {
-  // very basic curl parser — handles -X, -H, -d/--data, url
-  const tokens = s.match(/(?:[^\s'"]+|'[^']*'|"[^"]*")+/g).slice(1);
+  // very basic curl parser — handles -X, -H, -d/--data, url. Strips backslash
+  // line continuations so multiline pasted curl works.
+  const cleaned = String(s || '').replace(/\\\r?\n/g, ' ').trim();
+  const tokens = cleaned.match(/(?:[^\s'"]+|'[^']*'|"[^"]*")+/g);
+  if (!tokens || !tokens.length) throw new Error('empty curl');
+  const rest = tokens.slice(tokens[0].toLowerCase() === 'curl' ? 1 : 0);
+  const strip = t => t.replace(/^['"]|['"]$/g, '');
   const r = newRequest();
-  for (let i=0; i<tokens.length; i++) {
-    const t = tokens[i].replace(/^['"]|['"]$/g, '');
-    if (t === '-X' || t === '--request') r.method = tokens[++i].replace(/['"]/g,'').toUpperCase();
+  for (let i=0; i<rest.length; i++) {
+    const t = strip(rest[i]);
+    if (t === '-X' || t === '--request') r.method = strip(rest[++i] || 'GET').toUpperCase();
     else if (t === '-H' || t === '--header') {
-      const hv = tokens[++i].replace(/^['"]|['"]$/g,''); const idx = hv.indexOf(':');
-      r.headers.push({name: hv.slice(0,idx).trim(), value: hv.slice(idx+1).trim(), enabled:true});
-    } else if (t === '-d' || t === '--data' || t === '--data-raw') {
-      r.body.mode = 'raw'; r.body.raw = tokens[++i].replace(/^['"]|['"]$/g,''); r.body.rawType = 'json';
+      const hv = strip(rest[++i] || ''); const idx = hv.indexOf(':');
+      if (idx > 0) r.headers.push({key: hv.slice(0,idx).trim(), val: hv.slice(idx+1).trim(), desc:'', enabled:true});
+    } else if (t === '-d' || t === '--data' || t === '--data-raw' || t === '--data-binary') {
+      r.body.mode = 'raw'; r.body.raw = strip(rest[++i] || ''); r.body.rawType = 'json';
       if (r.method === 'GET') r.method = 'POST';
-    } else if (t.startsWith('http')) r.url = t;
+    } else if (t === '-u' || t === '--user') {
+      const cred = strip(rest[++i] || ''); const ci = cred.indexOf(':');
+      r.auth.type = 'basic';
+      r.auth.basic = ci < 0
+        ? { user: cred, pass: '' }
+        : { user: cred.slice(0, ci), pass: cred.slice(ci+1) };
+    } else if (/^https?:\/\//i.test(t)) r.url = t;
   }
   r.name = nameFromUrl(r.url) || 'Imported';
   return r;
@@ -1130,7 +1285,9 @@ function bindTopbar() {
   document.querySelector('[data-action="open-vars"]').addEventListener('click', openVarsInspector);
   document.querySelector('[data-action="import"]').addEventListener('click', openImportModal);
   document.querySelector('[data-action="export"]').addEventListener('click', openExportModal);
-  document.querySelector('[data-action="docs"]').addEventListener('click', openShortcuts);
+  document.querySelector('[data-action="docs"]').addEventListener('click', () => {
+    window.open('https://github.com/morroware/post-pigeon#readme', '_blank', 'noopener');
+  });
   document.querySelector('[data-action="shortcuts"]').addEventListener('click', openShortcuts);
   document.querySelector('[data-action="new-collection"]').addEventListener('click', () => {
     const name = prompt('Collection name?'); if (!name) return;
@@ -1158,15 +1315,34 @@ function bindTopbar() {
   });
 }
 
-/* ---------------- Server probe ---------------- */
+/* ---------------- Server probe ----------------
+   Probes proxy.php cheaply — sends an empty body, expects the 400
+   "Missing url" envelope. Confirms the file exists and PHP is wired up
+   without making an external HTTP call. */
 async function probeProxy() {
   const el = $('#serverStatus'); const txt = $('#serverStatusText');
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 3000);
   try {
-    const r = await fetch('proxy.php', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url:'https://httpbin.org/status/204', method:'HEAD'}) });
-    if (r.ok) { STATE.serverProxy = 'ok'; el.dataset.state = 'ok'; txt.textContent = 'proxy · ok'; return; }
-    throw new Error('bad');
+    const r = await fetch('proxy.php', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+      signal: ctrl.signal,
+    });
+    // proxy.php replies with HTTP 400 + JSON {error:'Missing url'} when called
+    // with no url. Anything else (404, network error) means it isn't reachable.
+    if (r.status === 400) {
+      let j = null; try { j = await r.json(); } catch {}
+      if (j && j.error) {
+        STATE.serverProxy = 'ok'; el.dataset.state = 'ok'; txt.textContent = 'proxy · ok'; return;
+      }
+    }
+    throw new Error('unexpected proxy response: ' + r.status);
   } catch {
     STATE.serverProxy = 'fallback'; el.dataset.state = 'warn'; txt.textContent = 'proxy offline · direct fetch (CORS)';
+  } finally {
+    clearTimeout(t);
   }
 }
 
@@ -1189,7 +1365,9 @@ function statusText(s) {
   await hydrate();
   renderSidebar();
   bindTopbar();
-  probeProxy();
+  // Await the probe so the first Send picks the right transport. The probe is
+  // a HEAD against a small endpoint — adds <500ms in the worst case.
+  await probeProxy();
   // Open one tab to start
   const seedReq = STATE.collections[0]?.requests[0] || newRequest({ method:'GET', url:'https://httpbin.org/get?hello={{baseUrl}}' });
   openRequestInTab(seedReq);

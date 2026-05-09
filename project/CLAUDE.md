@@ -93,11 +93,23 @@ sendBtn.click
 
 ## Known limitations / next steps
 - **Timeline** is synthetic — cURL doesn't expose phase timing through PHP without `CURLINFO_*` plumbing. Add to `proxy.php` if you want real DNS/TCP/TLS/wait/download numbers.
-- **No multipart file upload** end-to-end — UI accepts files but `proxy.php` would need to switch from a string `POSTFIELDS` to a `CURLFile` array. Stub is in place.
+- **No multipart file upload** end-to-end — UI accepts files but `proxy.php` would need to switch from a string `POSTFIELDS` to a `CURLFile` array. Stub is in place. UI shows a `•` badge when a file is selected, but `buildBody` returns null in binary mode for now.
 - **No cookie jar** — each request is independent. Easy to add: persist cookies per-host in `data/cookies.json`, inject as `Cookie:` header.
 - **No GraphQL helper** — could be a body mode that wraps `{query, variables}` JSON.
 - **No request chaining / runner** — would build on the existing `tests` sandbox.
-- **Single-user** by design. Stick a `.htpasswd` in front of the directory if you want auth.
+- **Single-user** by design. Stick a `.htpasswd` in front of the directory if you want auth. `proxy.php` is restricted to `http`/`https` to deny SSRF via `file://` etc., but it's still an open relay for outbound HTTP from your server — protect the URL path itself.
+
+## Hardening notes (for the curious)
+The codebase has been through a "rock solid" pass. A few things to be aware of when extending:
+
+- **Request schema is normalized on entry.** Any request entering the app from external data (collections, history, imports, JSON paste) goes through `normalizeRequest()`. Don't trust `r.auth.apikey.in` etc. without going through this — old saved data may be missing nested fields.
+- **Headers can come in two shapes.** The KV editor stores `{key, val}`; legacy/imported requests may use `{name, value}`. `buildHeaders()` accepts both and emits canonical `{name, value}` for the proxy.
+- **Method is locked to ASCII letters.** `normalizeRequest` rejects anything else. Don't loosen this without re-auditing every `data-m="..."` interpolation in the render functions, which currently rely on the invariant.
+- **`persist()` is debounced** (200ms). `persistNow()` is the immediate, awaitable version — use it where you need the write flushed before navigation (e.g. after Send adds to history).
+- **`renderResponse` clones the response subtab buttons on every Send** to drop any stale click handlers from the previous render. If you add a new response control, follow the same pattern (clone-and-replace before binding) or you'll leak listeners across sends.
+- **Iframe preview is sandboxed** (`sandbox=""`) — scripts and forms are blocked. If you need to render trusted HTML with scripting, allowlist with care.
+- **`proxy.php` enforces `http`/`https`** at both the URL parse layer and `CURLOPT_PROTOCOLS` — prevents `file://` reads and gopher-style SSRF even through redirects. It also caps the inbound JSON envelope at 1 MB and the outbound timeout at 600 s.
+- **`storage.php` writes are atomic** (temp file + `rename()`) and validate the payload as JSON before committing. The data dir is auto-created with 0755 if missing.
 
 ## Testing
 No formal test suite. Smoke checklist:
