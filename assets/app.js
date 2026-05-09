@@ -58,20 +58,59 @@ async function persist() {
     });
   } catch {}
 }
+// Old rows may have been persisted with {name, value}; the UI binds {key, val}.
+// Normalize so we don't silently drop user-entered headers.
+function normalizeKVRows(arr) {
+  if (!Array.isArray(arr)) return [];
+  return arr.map(r => {
+    if (!r || typeof r !== 'object') return { key:'', val:'', desc:'', enabled:true };
+    const out = { ...r };
+    if (out.key === undefined && out.name !== undefined) out.key = out.name;
+    if (out.val === undefined && out.value !== undefined) out.val = out.value;
+    if (out.enabled === undefined) out.enabled = true;
+    return out;
+  });
+}
+function normalizeRequest(r) {
+  if (!r || typeof r !== 'object') return newRequest();
+  for (const k of ['params','headers','form','urlencoded']) {
+    r[k] = normalizeKVRows(r[k]);
+  }
+  return r;
+}
+function applySnapshot(snap) {
+  if (!snap || typeof snap !== 'object') return;
+  if (Array.isArray(snap.collections)) {
+    STATE.collections = snap.collections.map(c => {
+      const out = { ...c };
+      out.requests = Array.isArray(c.requests) ? c.requests.map(normalizeRequest) : [];
+      return out;
+    });
+  }
+  if (Array.isArray(snap.history)) {
+    STATE.history = snap.history.map(h => {
+      const out = { ...h };
+      if (out.snapshot) out.snapshot = normalizeRequest(out.snapshot);
+      return out;
+    });
+  }
+  if (Array.isArray(snap.envs)) STATE.envs = snap.envs;
+  if (typeof snap.activeEnvId === 'string') STATE.activeEnvId = snap.activeEnvId;
+}
 async function hydrate() {
   // Prefer server snapshot.
   try {
     const r = await fetch('storage.php?action=get&bucket=workspace');
     if (r.ok) {
       const j = await r.json();
-      if (j && j.data) Object.assign(STATE, j.data);
+      if (j && j.data) applySnapshot(j.data);
     }
   } catch {}
   // Fallback to localStorage.
   if (!STATE.collections.length && !STATE.history.length && !STATE.envs.length) {
     try {
       const cached = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
-      if (cached) Object.assign(STATE, cached);
+      if (cached) applySnapshot(cached);
     } catch {}
   }
   if (!STATE.collections.length) seed();
@@ -146,12 +185,15 @@ async function sendRequest(req) {
   const headers = buildHeaders(req);
   const body = buildBody(req);
 
+  let timeout = +req.settings.timeout || 30;
+  if (timeout < 1)   timeout = 1;
+  if (timeout > 600) timeout = 600;
   const payload = {
     method: req.method,
     url,
     headers,
     body,
-    timeout: req.settings.timeout || 30,
+    timeout,
     followRedirects: !!req.settings.followRedirects,
     verifySSL: req.settings.verifySSL !== false,
   };
@@ -164,23 +206,37 @@ async function sendRequest(req) {
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify(payload),
       });
-      resp = await r.json();
+      try {
+        resp = await r.json();
+      } catch (e) {
+        resp = { error: 'Proxy returned a non-JSON response (HTTP ' + r.status + ')', timeMs: Math.round(performance.now() - t0) };
+      }
     } else {
       // Direct fetch fallback (will hit CORS for many APIs).
       const init = { method: req.method, headers: {} };
       for (const h of headers) if (h.name) init.headers[h.name] = h.value || '';
       if (body && !['GET','HEAD'].includes(req.method)) init.body = body;
-      const r = await fetch(url, init);
-      const txt = await r.text();
-      const hdrs = []; r.headers.forEach((v,k) => hdrs.push({name:k, value:v}));
-      resp = {
-        status: r.status, headers: hdrs, body: txt,
-        timeMs: Math.round(performance.now() - t0),
-        sizeBytes: txt.length, finalUrl: r.url, redirects: 0,
-      };
+      const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      let timer = null;
+      if (ctl) {
+        init.signal = ctl.signal;
+        timer = setTimeout(() => ctl.abort(), timeout * 1000);
+      }
+      try {
+        const r = await fetch(url, init);
+        const txt = await r.text();
+        const hdrs = []; r.headers.forEach((v,k) => hdrs.push({name:k, value:v}));
+        resp = {
+          status: r.status, headers: hdrs, body: txt,
+          timeMs: Math.round(performance.now() - t0),
+          sizeBytes: txt.length, finalUrl: r.url, redirects: 0,
+        };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
   } catch (err) {
-    resp = { error: String(err.message || err), timeMs: Math.round(performance.now() - t0) };
+    resp = { error: String(err && err.message || err), timeMs: Math.round(performance.now() - t0) };
   }
 
   req.response = resp;
@@ -207,12 +263,16 @@ function buildUrl(req) {
   return url;
 }
 function buildHeaders(req) {
-  const out = req.headers.filter(h => h.enabled !== false && h.name)
-    .map(h => ({ name: resolveVars(h.name), value: resolveVars(h.value || '') }));
+  // KV rows store {key, val, desc, enabled}. The proxy wire format uses {name, value}.
+  const out = req.headers.filter(h => h.enabled !== false && (h.key || h.name))
+    .map(h => ({
+      name:  resolveVars(h.key  ?? h.name  ?? ''),
+      value: resolveVars(h.val  ?? h.value ?? ''),
+    }));
   // Auth
   const a = req.auth;
   if (a.type === 'basic' && a.basic.user) {
-    out.push({ name: 'Authorization', value: 'Basic ' + btoa(resolveVars(a.basic.user)+':'+resolveVars(a.basic.pass||'')) });
+    out.push({ name: 'Authorization', value: 'Basic ' + utf8Btoa(resolveVars(a.basic.user)+':'+resolveVars(a.basic.pass||'')) });
   } else if (a.type === 'bearer' && a.bearer.token) {
     out.push({ name: 'Authorization', value: 'Bearer ' + resolveVars(a.bearer.token) });
   } else if (a.type === 'apikey' && a.apikey.key) {
@@ -469,12 +529,22 @@ function bindPanel(panel, tab) {
   updateBadges();
   function updateBadges() {
     panel.querySelector('[data-count="params"]').textContent = (r.params.filter(p=>p.enabled!==false&&p.key).length||'');
-    panel.querySelector('[data-count="headers"]').textContent = (r.headers.filter(p=>p.enabled!==false&&p.name).length||'');
+    panel.querySelector('[data-count="headers"]').textContent = (r.headers.filter(p=>p.enabled!==false&&p.key).length||'');
     const bodyCount = r.body.mode==='none' ? '' :
       r.body.mode==='raw' ? (r.body.raw?'•':'') :
       (r[r.body.mode] || []).filter(p=>p.enabled!==false&&p.key).length || '';
     panel.querySelector('[data-count="body"]').textContent = bodyCount;
   }
+  // Recompute counts live as KV rows change.
+  const onKVChanged = () => { if (panel.isConnected) updateBadges(); };
+  document.addEventListener('pp:kv-changed', onKVChanged);
+  // Drop the listener once the panel is detached.
+  new MutationObserver((_, obs) => {
+    if (!panel.isConnected) {
+      document.removeEventListener('pp:kv-changed', onKVChanged);
+      obs.disconnect();
+    }
+  }).observe(document.getElementById('workspaceBody'), { childList: true });
 
   // Keyboard shortcut: Ctrl/Cmd+Enter to send
   panel.addEventListener('keydown', e => {
@@ -540,17 +610,24 @@ function buildKVRow(target, row) {
   const tpl = $('#tpl-kv-row').content.cloneNode(true);
   const el = tpl.querySelector('.kv-row');
   el.dataset.disabled = (row.enabled === false);
+  const refresh = () => {
+    const tab = activeTab();
+    if (tab) markDirty(tab);
+    // Recompute count badges live as keys are typed.
+    document.dispatchEvent(new CustomEvent('pp:kv-changed', { detail: { target } }));
+  };
   const c = el.querySelector('.kv-check');
   c.checked = row.enabled !== false;
-  c.addEventListener('change', () => { row.enabled = c.checked; el.dataset.disabled = !c.checked; });
-  const k = el.querySelector('.kv-key'); k.value = row.key;  k.addEventListener('input', () => row.key = k.value);
-  const v = el.querySelector('.kv-val'); v.value = row.val;  v.addEventListener('input', () => row.val = v.value);
-  const d = el.querySelector('.kv-desc'); d.value = row.desc||''; d.addEventListener('input', () => row.desc = d.value);
+  c.addEventListener('change', () => { row.enabled = c.checked; el.dataset.disabled = !c.checked; refresh(); });
+  const k = el.querySelector('.kv-key'); k.value = row.key || '';  k.addEventListener('input', () => { row.key = k.value; refresh(); });
+  const v = el.querySelector('.kv-val'); v.value = row.val || '';  v.addEventListener('input', () => { row.val = v.value; refresh(); });
+  const d = el.querySelector('.kv-desc'); d.value = row.desc||''; d.addEventListener('input', () => { row.desc = d.value; refresh(); });
   if (target === 'form') d.placeholder = 'text · file';
   el.querySelector('.kv-del').addEventListener('click', () => {
     const arr = activeTab().request[target];
     const i = arr.indexOf(row); if (i>=0) arr.splice(i,1);
     el.remove();
+    refresh();
   });
   return el;
 }
@@ -561,16 +638,26 @@ function bindSplitter(panel) {
   const bot = $('.splitpane-bot', panel);
   const div = $('.splitpane-divider', panel);
   let dragging = false;
-  div.addEventListener('mousedown', () => { dragging = true; document.body.style.cursor = 'row-resize'; });
-  window.addEventListener('mouseup', () => { dragging = false; document.body.style.cursor = ''; });
-  window.addEventListener('mousemove', e => {
+  const onMove = e => {
     if (!dragging) return;
+    if (!panel.isConnected) { stop(); return; }
     const rect = panel.getBoundingClientRect();
     const reqRect = $('.reqbar', panel).getBoundingClientRect();
     const offset = e.clientY - reqRect.bottom;
     const total = rect.bottom - reqRect.bottom;
+    if (total <= 0) return;
     const ratio = Math.max(0.18, Math.min(0.82, offset / total));
     top.style.flex = `${ratio} 0 0`; bot.style.flex = `${1-ratio} 0 0`;
+  };
+  const stop = () => {
+    dragging = false; document.body.style.cursor = '';
+    window.removeEventListener('mousemove', onMove);
+    window.removeEventListener('mouseup', stop);
+  };
+  div.addEventListener('mousedown', () => {
+    dragging = true; document.body.style.cursor = 'row-resize';
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', stop);
   });
 }
 
@@ -603,39 +690,41 @@ function renderResponse(panel, r) {
     <button class="ghost-btn" data-action="copy-resp">copy</button>
     <button class="ghost-btn" data-action="save-resp">save</button>
   `;
-  meta.querySelector('[data-action="copy-resp"]').addEventListener('click', () => {
-    navigator.clipboard.writeText(res.body || ''); toast('Response copied', 'ok');
-  });
-  meta.querySelector('[data-action="save-resp"]').addEventListener('click', () => {
+  meta.querySelector('[data-action="copy-resp"]').onclick = () => {
+    if (navigator.clipboard) navigator.clipboard.writeText(res.body || '');
+    toast('Response copied', 'ok');
+  };
+  meta.querySelector('[data-action="save-resp"]').onclick = () => {
     const blob = new Blob([res.body || ''], {type: 'text/plain'});
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
     a.download = 'response.txt'; a.click();
-  });
+  };
 
   $('[data-bodyviewmode]', panel).hidden = false;
   $('.resp-search', panel).hidden = false;
 
-  // Subtab switching
+  // Subtab switching — use .onclick so re-renders replace, not stack, handlers.
   const respTabs = $$('.subtab', tabsBar);
   respTabs.forEach(t => t.classList.remove('is-active'));
   respTabs[0].classList.add('is-active');
-  respTabs.forEach(t => t.addEventListener('click', () => {
+  respTabs.forEach(t => t.onclick = () => {
     respTabs.forEach(x => x.classList.toggle('is-active', x===t));
     drawRespBody(t.dataset.subtab);
-  }));
+  });
 
   // View mode
   const vmBtns = $$('[data-bodyviewmode] .seg', panel);
   let viewMode = 'pretty';
-  vmBtns.forEach(b => b.addEventListener('click', () => {
+  vmBtns.forEach(b => b.onclick = () => {
     vmBtns.forEach(x => x.classList.toggle('is-active', x===b));
     viewMode = b.dataset.viewmode; drawRespBody('body');
-  }));
+  });
 
   // Search
   let searchTerm = '';
   const searchInput = panel.querySelector('[data-action="search-resp"]');
-  searchInput.addEventListener('input', () => { searchTerm = searchInput.value; drawRespBody('body'); });
+  searchInput.value = '';
+  searchInput.oninput = () => { searchTerm = searchInput.value; drawRespBody('body'); };
 
   // Header/test counts
   panel.querySelector('[data-count="resp-headers"]').textContent = res.headers.length || '';
@@ -658,6 +747,9 @@ function renderResponse(panel, r) {
       } else if (viewMode === 'preview' && ct.includes('html')) {
         const iframe = document.createElement('iframe');
         iframe.style.cssText = 'flex:1; width:100%; border:0; background:#fff;';
+        // Sandbox: never run scripts or top-level navigation from previewed HTML.
+        iframe.setAttribute('sandbox', '');
+        iframe.referrerPolicy = 'no-referrer';
         iframe.srcdoc = res.body || '';
         body.appendChild(iframe); return;
       } else {
@@ -698,18 +790,20 @@ function renderResponse(panel, r) {
     }
     if (which === 'timeline') {
       const total = res.timeMs || 0;
+      const denom = Math.max(1, total);
       // synthetic split (proxy doesn't expose phases)
       const dns = Math.round(total*0.05), tcp = Math.round(total*0.10),
             tls = Math.round(total*0.10), wait = Math.round(total*0.65),
-            dl  = total - dns - tcp - tls - wait;
+            dl  = Math.max(0, total - dns - tcp - tls - wait);
+      const pct = n => ((n / denom) * 100).toFixed(2);
       const wrap = document.createElement('div'); wrap.className = 'timeline';
       wrap.innerHTML = `
         <div class="timeline-bar">
-          <span class="seg-dns" style="width:${dns/total*100}%"></span>
-          <span class="seg-tcp" style="width:${tcp/total*100}%"></span>
-          <span class="seg-tls" style="width:${tls/total*100}%"></span>
-          <span class="seg-wait" style="width:${wait/total*100}%"></span>
-          <span class="seg-download" style="width:${dl/total*100}%"></span>
+          <span class="seg-dns" style="width:${pct(dns)}%"></span>
+          <span class="seg-tcp" style="width:${pct(tcp)}%"></span>
+          <span class="seg-tls" style="width:${pct(tls)}%"></span>
+          <span class="seg-wait" style="width:${pct(wait)}%"></span>
+          <span class="seg-download" style="width:${pct(dl)}%"></span>
         </div>
         <div class="timeline-legend">
           <span><i class="seg-dns" style="background:#5b8def"></i>DNS ${dns} ms</span>
@@ -854,10 +948,15 @@ function refreshAllOverlays() {
 }
 
 /* ---------------- Modals ---------------- */
+let _modalOverlayBound = false;
 function openModal(html) {
   const root = $('#modalRoot');
   root.innerHTML = html; root.hidden = false;
-  root.addEventListener('click', e => { if (e.target === root) closeModal(); }, { once: true });
+  if (!_modalOverlayBound) {
+    // One persistent listener: close only when the click was on the overlay itself.
+    root.addEventListener('click', e => { if (e.target === root) closeModal(); });
+    _modalOverlayBound = true;
+  }
   return root.firstElementChild;
 }
 function closeModal() { const r = $('#modalRoot'); r.innerHTML = ''; r.hidden = true; }
@@ -1055,14 +1154,16 @@ function openImportModal() {
 }
 function parseCurl(s) {
   // very basic curl parser — handles -X, -H, -d/--data, url
-  const tokens = s.match(/(?:[^\s'"]+|'[^']*'|"[^"]*")+/g).slice(1);
+  const matched = s.match(/(?:[^\s'"]+|'[^']*'|"[^"]*")+/g);
+  if (!matched || matched.length < 2) throw new Error('No tokens in curl command');
+  const tokens = matched.slice(1);
   const r = newRequest();
   for (let i=0; i<tokens.length; i++) {
     const t = tokens[i].replace(/^['"]|['"]$/g, '');
     if (t === '-X' || t === '--request') r.method = tokens[++i].replace(/['"]/g,'').toUpperCase();
     else if (t === '-H' || t === '--header') {
       const hv = tokens[++i].replace(/^['"]|['"]$/g,''); const idx = hv.indexOf(':');
-      r.headers.push({name: hv.slice(0,idx).trim(), value: hv.slice(idx+1).trim(), enabled:true});
+      if (idx > 0) r.headers.push({key: hv.slice(0,idx).trim(), val: hv.slice(idx+1).trim(), enabled:true});
     } else if (t === '-d' || t === '--data' || t === '--data-raw') {
       r.body.mode = 'raw'; r.body.raw = tokens[++i].replace(/^['"]|['"]$/g,''); r.body.rawType = 'json';
       if (r.method === 'GET') r.method = 'POST';
@@ -1162,17 +1263,35 @@ function bindTopbar() {
 async function probeProxy() {
   const el = $('#serverStatus'); const txt = $('#serverStatusText');
   try {
-    const r = await fetch('proxy.php', { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url:'https://httpbin.org/status/204', method:'HEAD'}) });
-    if (r.ok) { STATE.serverProxy = 'ok'; el.dataset.state = 'ok'; txt.textContent = 'proxy · ok'; return; }
-    throw new Error('bad');
+    // Probe with an empty body. A live proxy.php returns 400 {error:"Missing url"};
+    // anything that is NOT proxy.php (404, HTML 200, etc.) won't match.
+    const r = await fetch('proxy.php', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+    let alive = false;
+    try {
+      const j = await r.json();
+      alive = (r.status === 400 && j && j.error) || (r.ok && j && (j.status !== undefined || j.error !== undefined));
+    } catch {}
+    if (alive) {
+      STATE.serverProxy = 'ok'; el.dataset.state = 'ok'; txt.textContent = 'proxy · ok'; return;
+    }
+    throw new Error('proxy did not respond as expected');
   } catch {
     STATE.serverProxy = 'fallback'; el.dataset.state = 'warn'; txt.textContent = 'proxy offline · direct fetch (CORS)';
   }
 }
 
 /* ---------------- Helpers ---------------- */
-function escapeHtml(s) { return String(s ?? '').replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
+function escapeHtml(s) { return String(s ?? '').replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])); }
 function escapeRegex(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function utf8Btoa(s) {
+  // btoa() throws on multi-byte chars. Encode to UTF-8 first.
+  try { return btoa(unescape(encodeURIComponent(String(s)))); }
+  catch { return btoa(String(s).replace(/[^\x00-\xff]/g, '?')); }
+}
 function timeAgo(ts) {
   const d = (Date.now()-ts)/1000;
   if (d < 60) return Math.floor(d)+'s';
@@ -1189,7 +1308,9 @@ function statusText(s) {
   await hydrate();
   renderSidebar();
   bindTopbar();
-  probeProxy();
+  // Await the probe so the very first Send picks the right path
+  // (proxy vs. direct fetch fallback) instead of racing the network.
+  await probeProxy();
   // Open one tab to start
   const seedReq = STATE.collections[0]?.requests[0] || newRequest({ method:'GET', url:'https://httpbin.org/get?hello={{baseUrl}}' });
   openRequestInTab(seedReq);
