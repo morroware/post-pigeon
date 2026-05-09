@@ -1,0 +1,5 @@
+# Post Pigeon — protect persisted JSON from direct download.
+<FilesMatch "\.json$">
+  Require all denied
+</FilesMatch>
+DirectoryIndex index.php index.html app.html
